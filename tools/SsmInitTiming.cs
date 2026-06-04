@@ -1,17 +1,20 @@
-// SsmInitTiming.cs — Measure SSM init (0xBF) and batch read latency via J2534 (Tactrix OpenPort 2.0)
+// SsmInitTiming.cs — SSM pre-flight check + timing tool via J2534 (Tactrix OpenPort 2.0)
 //
-// Produces two sets of timing numbers needed for Arduino K-Line logger firmware:
-//   Test 1: SSM init (0xBF) — 15 iterations
-//           → ECU ROM ID, init ECU proc gap, recommended Phase 1 first-byte timeout
-//   Test 2: Batch read (0xA8, slow poll) — 20 iterations
-//           → read ECU proc gap, recommended Phase 2 fast-poll watchdog
+// PURPOSE: validate everything the Arduino K-Line logger depends on, BEFORE relying on
+// the Arduino — so on-car troubleshooting is minimized. It:
+//   • measures init (0xBF) + batch-read (0xA8) round-trip timing (firmware constants)
+//   • decodes the ECU init response: ROM ID + capability bitmap
+//   • maps the capability bits to supported P-parameter NAMES via logger_*.xml
+//   • live-reads known params (RPM, coolant, battery, …) and decodes engineering values
+//   • probes the ECU's max batch-read size (validates the firmware byte budget)
 //
-// Compile: C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /platform:x86 SsmInitTiming.cs /out:SsmInitTiming.exe
-// Run:     SsmInitTiming.exe
+// Compile: C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /platform:x86 /out:SsmInitTiming.exe SsmInitTiming.cs
+// Run:     SsmInitTiming.exe   (run from the folder containing logger_*.xml for name mapping)
 // Prereq:  Tactrix plugged into OBD2, key-on or engine running, RomRaider NOT open
 
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -69,8 +72,8 @@ class SsmInitTiming
         new byte[]{ 0x00, 0x00, 0x02 },
     };
 
-    const int INIT_ITERS = 15;
-    const int READ_ITERS = 20;
+    const int INIT_ITERS = 5;    // timing is well-characterised now; a few samples suffice
+    const int READ_ITERS = 5;
 
     // ── J2534 function pointers ──────────────────────────────────────────────
     static dWriteMsgs   WriteMsgs;
@@ -78,8 +81,9 @@ class SsmInitTiming
     static dGetLastError GetLastError;
 
     // ────────────────────────────────────────────────────────────────────────
-    static void Main()
+    static void Main(string[] args)
     {
+        bool brakeMode = (args.Length > 0 && args[0].ToLowerInvariant() == "brake");
         Log("=== SsmInitTiming — K-Line logger firmware timing reference ===");
         Log("DLL: " + DLL);
         Log("");
@@ -150,6 +154,26 @@ class SsmInitTiming
 
         Thread.Sleep(100);
 
+        // Brake-watch mode: sample the brake-switch byte repeatedly so the bit can be
+        // seen toggling live. Run as:  SsmInitTiming.exe brake
+        if (brakeMode)
+        {
+            Log("══ Brake-switch watch — press/release the pedal (S67 bit3, S64 bit6) ══");
+            for (int i = 0; i < 40; i++)
+            {
+                byte[] d = ReadAddrs(chanId, new byte[][] { ParseAddr("0x000121") });
+                if (d != null)
+                    Log(string.Format("  [{0,2}]  byte=0x{1:X2}   Brake(S67)={2}   StopLight(S64)={3}",
+                        i, d[0], (d[0] >> 3) & 1, (d[0] >> 6) & 1));
+                else
+                    Log("  [" + i + "]  no response");
+                Thread.Sleep(200);
+            }
+            Disconnect(chanId); Close(devId);
+            Log("\nDone (brake watch).");
+            return;
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // TEST 1 — SSM Init (0xBF) repeated INIT_ITERS times
         //
@@ -176,12 +200,12 @@ class SsmInitTiming
         int    initGood    = 0;
         int    consecTO    = 0;   // consecutive timeouts → bail out early
         string romId       = null;
+        byte[] initResp    = null;   // full response, kept for the pre-flight decode below
 
         for (int i = 0; i < INIT_ITERS; i++)
         {
             if (i > 0) Thread.Sleep(250); // let ECU settle between inits
 
-            Verbose = (i == 0);   // dump device-level detail on the first attempt
             long ta = Stopwatch.GetTimestamp();
             Send(chanId, initPkt);
             byte[] resp = Recv(chanId, 3000);
@@ -199,19 +223,19 @@ class SsmInitTiming
             initRespLen[initGood] = resp.Length;
             initGood++;
 
-            // Extract ROM ID from first successful response: bytes [5..9]
-            if (romId == null && resp.Length >= 10)
+            // ROM ID = response bytes [8..12] (after 0xFF + 3-byte SSM-ID + ).  This is the
+            // value the firmware, RomRaider, and the defs use to match <ecuparam> blocks.
+            if (romId == null && resp.Length >= 13)
             {
+                initResp = resp;
                 var sb = new StringBuilder();
-                for (int b = 5; b <= 9; b++) sb.AppendFormat("{0:X2}", resp[b]);
+                for (int b = 8; b <= 12; b++) sb.AppendFormat("{0:X2}", resp[b]);
                 romId = sb.ToString();
             }
 
             double dtMs = Ticks2Ms(tb - ta);
-            if (i < 3)
+            if (i == 0)
                 Log("  [" + i + "] " + resp.Length + " bytes  dt=" + dtMs.ToString("F2") + " ms  RX: " + Hex(resp));
-            else if (i == 3)
-                Log("  (suppressing raw dumps for remaining iterations)");
             else
                 Log("  [" + i + "] " + resp.Length + " bytes  dt=" + dtMs.ToString("F2") + " ms");
         }
@@ -260,6 +284,21 @@ class SsmInitTiming
         Log("    (wait this long before re-sending 0xBF if mid-response timeout suspected)");
 
         // ════════════════════════════════════════════════════════════════════
+        // PRE-FLIGHT CHECKS — validate what the Arduino firmware depends on
+        // ════════════════════════════════════════════════════════════════════
+        if (initResp != null)
+        {
+            string defs = FindDefs();
+            DecodeInit(initResp);                          // ROM ID + capability bitmap + checksum check
+            MapCapabilities(initResp, defs);               // capability bits → supported P-param names
+            DefaultParamCheck(chanId, defs, initResp);     // the 12 default params at their real addresses
+            ExtendedAddrCheck(chanId, defs, romId);        // E-param extended-address reads
+            SwitchCheck(chanId, defs, initResp);           // switch (S-param) T_BIT reads
+        }
+        LiveParamChecks(chanId);                  // read known params, decode engineering values
+        MaxBatchProbe(chanId);                    // largest batch the ECU answers
+
+        // ════════════════════════════════════════════════════════════════════
         // TEST 2 — Batch read (0xA8, slow poll) repeated READ_ITERS times
         //
         // Packet: 80 10 F0 <len> A8 00 <addrs...> <cs>
@@ -292,10 +331,8 @@ class SsmInitTiming
             if (resp != null)
             {
                 readDeltas[readGood++] = tb - ta;
-                if (i < 3)
+                if (i == 0)
                     Log("  [" + i + "] dt=" + Ticks2Ms(tb-ta).ToString("F2") + " ms  RX: " + Hex(resp));
-                else if (i == 3)
-                    Log("  (suppressing raw dumps)");
                 else
                     Log("  [" + i + "] dt=" + Ticks2Ms(tb-ta).ToString("F2") + " ms");
             }
@@ -334,6 +371,8 @@ class SsmInitTiming
             Log("  ► Phase 2 watchdog timeout: " + (rMaxMs * 3).ToString("F0") + " ms  (3× max round-trip)");
         }
 
+        ContinuousTest(chanId);   // item 4 — streaming fast-poll rate (run last; it leaves the bus quiet)
+
         // ════════════════════════════════════════════════════════════════════
         // SUMMARY — Copy these values into Arduino firmware
         // ════════════════════════════════════════════════════════════════════
@@ -356,6 +395,338 @@ class SsmInitTiming
         Disconnect(chanId);
         Close(devId);
         Log("\nDone.");
+    }
+
+    // ── Pre-flight checks ────────────────────────────────────────────────────
+
+    // Build a 3-byte SSM address 0x0000xx (low RAM, where the standard P-params live).
+    static byte[] Addr(int low) { return new byte[] { 0x00, 0x00, (byte)low }; }
+
+    // Single 0xA8 batch read of the given addresses; returns the N data bytes, or null.
+    static byte[] ReadAddrs(uint chanId, byte[][] addrs)
+    {
+        Thread.Sleep(10);
+        Send(chanId, BuildBatchRead(addrs, false));
+        byte[] r = Recv(chanId, 2500);
+        // Response: 80 F0 10 <N+1> E8 <N data bytes> <cs>
+        if (r == null || r.Length < 6 + addrs.Length) return null;
+        if (r[0] != 0x80 || r[1] != 0xF0 || r[2] != 0x10 || r[4] != 0xE8) return null;
+        byte[] data = new byte[addrs.Length];
+        Array.Copy(r, 5, data, 0, addrs.Length);
+        return data;
+    }
+
+    static string Hex2(byte[] b, int off, int len)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < len && off + i < b.Length; i++) { if (i > 0) sb.Append(' '); sb.Append(b[off + i].ToString("X2")); }
+        return sb.ToString();
+    }
+
+    // Decode the SSM init response into labeled sections + the capability bitmap.
+    static void DecodeInit(byte[] r)
+    {
+        Log("");
+        Log("── ECU init response decode ─────────────────────────────────────────");
+        if (r.Length < 14) { Log("    (response too short to decode)"); return; }
+        int dataLen  = r[3];
+        int capStart = 13;             // after 0xFF(4) + SSM-ID(5..7) + ROM-ID(8..12)
+        int capEnd   = 4 + dataLen;    // index of the checksum byte
+        if (capEnd > r.Length - 1) capEnd = r.Length - 1;
+        Log("    Header:          " + Hex2(r, 0, 4) + "   (80 F0 10 len)");
+        Log("    Command:         " + r[4].ToString("X2"));
+        Log("    SSM ID:          " + Hex2(r, 5, 3));
+        Log("    ROM ID:          " + Hex2(r, 8, 5) + "   <- matches firmware / defs <ecuparam>");
+        Log("    Capability (" + (capEnd - capStart) + " B): " + Hex2(r, capStart, capEnd - capStart));
+        byte cs = 0; for (int k = 0; k < r.Length - 1; k++) cs += r[k];
+        Log("    Checksum:        " + r[r.Length - 1].ToString("X2") +
+            (cs == r[r.Length - 1] ? "   (verified: matches our SSM checksum calc)"
+                                   : "   (MISMATCH! we calc " + cs.ToString("X2") + ")"));
+
+        int setCount = 0;
+        for (int i = capStart; i < capEnd; i++)
+            for (int bit = 0; bit < 8; bit++)
+                if ((r[i] & (1 << bit)) != 0) setCount++;
+        Log("    Capability bits set: " + setCount + "  (each gates one P-param via rawResp[5+byteIndex] & (1<<bit))");
+    }
+
+    // Parse a logger_*.xml and list which capability-gated P-params THIS ECU supports.
+    static void MapCapabilities(byte[] r, string defsPath)
+    {
+        Log("");
+        Log("── Supported P-parameters (capability bit -> name via defs) ──────────");
+        if (defsPath == null || !File.Exists(defsPath))
+        {
+            Log("    (no logger_*.xml in this folder — skipping name mapping)");
+            return;
+        }
+        Log("    defs: " + Path.GetFileName(defsPath));
+        int supported = 0, gated = 0;
+        foreach (string line in File.ReadAllLines(defsPath))
+        {
+            if (line.IndexOf("</protocol>") >= 0) break;   // SSM is the first protocol; stop before OBD
+            if (line.IndexOf("<parameter ") < 0) continue;
+            string bi = Attr(line, "ecubyteindex");
+            string bt = Attr(line, "ecubit");
+            if (bi == null || bt == null) continue;
+            int byteIdx, bit;
+            if (!int.TryParse(bi, out byteIdx) || !int.TryParse(bt, out bit)) continue;
+            gated++;
+            int idx = 5 + byteIdx;     // firmware: rawResp[5 + ecuByteIndex]
+            if (idx < r.Length && (r[idx] & (1 << bit)) != 0)
+            {
+                supported++;
+                Log(string.Format("    {0,-5} {1}", Attr(line, "id"), Attr(line, "name")));
+            }
+        }
+        Log("    -> " + supported + " of " + gated + " capability-gated P-params supported by this ECU.");
+    }
+
+    // Live-read a few well-known params at fixed SSM addresses and decode them.
+    static void LiveParamChecks(uint chanId)
+    {
+        Log("");
+        Log("── Live parameter sanity reads ──────────────────────────────────────");
+        Log("  (proves read -> byte-order -> scaling end-to-end; values should look sane)");
+        byte[] d;
+        d = ReadAddrs(chanId, new[] { Addr(0x0E), Addr(0x0F) });
+        if (d != null) Log(string.Format("    Engine speed:    {0,7:F0} rpm    (raw {1:X2}{2:X2})", (d[0] * 256 + d[1]) / 4.0, d[0], d[1]));
+        d = ReadAddrs(chanId, new[] { Addr(0x08) });
+        if (d != null) Log(string.Format("    Coolant temp:    {0,7:F0} C      (raw {1:X2})", d[0] - 40.0, d[0]));
+        d = ReadAddrs(chanId, new[] { Addr(0x12) });
+        if (d != null) Log(string.Format("    Intake air temp: {0,7:F0} C      (raw {1:X2})", d[0] - 40.0, d[0]));
+        d = ReadAddrs(chanId, new[] { Addr(0x15) });
+        if (d != null) Log(string.Format("    Throttle:        {0,7:F1} %      (raw {1:X2})", d[0] * 100.0 / 255.0, d[0]));
+        d = ReadAddrs(chanId, new[] { Addr(0x10) });
+        if (d != null) Log(string.Format("    Vehicle speed:   {0,7:F0} km/h   (raw {1:X2})", (double)d[0], d[0]));
+        d = ReadAddrs(chanId, new[] { Addr(0x1C) });
+        if (d != null) Log(string.Format("    Battery:         {0,7:F2} V      (raw {1:X2})", d[0] * 0.08, d[0]));
+    }
+
+    // Probe how large a single 0xA8 batch this ECU will answer (firmware budget ~84).
+    static void MaxBatchProbe(uint chanId)
+    {
+        Log("");
+        Log("── Max batch-read probe ─────────────────────────────────────────────");
+        int[] sizes = { 1, 8, 16, 24, 32, 34, 36, 38, 40, 44, 48, 56, 64, 80, 84 };
+        int lastOk = 0;
+        foreach (int n in sizes)
+        {
+            var addrs = new byte[n][];
+            for (int i = 0; i < n; i++) addrs[i] = new byte[] { 0x00, 0x00, (byte)i };
+            Send(chanId, BuildBatchRead(addrs, false));
+            byte[] resp = Recv(chanId, 2500);
+            bool ok = resp != null && resp.Length >= 6 + n && resp[4] == 0xE8;
+            Log(string.Format("    {0,3} addr -> {1}", n, ok ? "OK (" + resp.Length + " bytes)" : "no/bad response"));
+            if (ok) lastOk = n; else break;
+            Thread.Sleep(30);
+        }
+        Log("    -> ECU answered batches up to " + lastOk + " addresses.");
+    }
+
+    // Extract attr="value" from a line; null if absent.
+    static string Attr(string line, string name)
+    {
+        int i = line.IndexOf(name + "=\"");
+        if (i < 0) return null;
+        i += name.Length + 2;
+        int j = line.IndexOf('"', i);
+        return j < 0 ? null : line.Substring(i, j - i);
+    }
+
+    // Pick the defs file for capability name mapping — prefer the firmware's primary
+    // (logger_IMP_EN_v370.xml), then any English variant, then the first logger_*.xml.
+    static string FindDefs()
+    {
+        try {
+            string dir = AppDomain.CurrentDomain.BaseDirectory;
+            string primary = Path.Combine(dir, "logger_IMP_EN_v370.xml");
+            if (File.Exists(primary)) return primary;
+            var files = Directory.GetFiles(dir, "logger_*.xml");
+            foreach (var f in files) if (f.IndexOf("_EN_", StringComparison.OrdinalIgnoreCase) >= 0) return f;
+            return files.Length > 0 ? files[0] : null;
+        } catch { return null; }
+    }
+
+    // Build a 3-byte SSM address from a "0xNNNNNN" hex string.
+    static byte[] ParseAddr(string hex)
+    {
+        hex = hex.Trim();
+        if (hex.StartsWith("0x") || hex.StartsWith("0X")) hex = hex.Substring(2);
+        uint v = Convert.ToUInt32(hex, 16);
+        return new byte[] { (byte)(v >> 16), (byte)(v >> 8), (byte)v };
+    }
+
+    // N consecutive 3-byte addresses from a base (for multi-byte params).
+    static byte[][] ConsecAddrs(byte[] b, int n)
+    {
+        uint v = (uint)((b[0] << 16) | (b[1] << 8) | b[2]);
+        var res = new byte[n][];
+        for (int i = 0; i < n; i++) { uint a = v + (uint)i; res[i] = new byte[] { (byte)(a >> 16), (byte)(a >> 8), (byte)a }; }
+        return res;
+    }
+
+    static string Trunc(string s, int n) { if (s == null) return ""; return s.Length <= n ? s : s.Substring(0, n); }
+
+    // ITEM 1 — read real ECU-specific (E-param) addresses for THIS ROM. They live in
+    // the extended 0x02xxxx / 0xFFxxxx region (everything else we read is low RAM), so
+    // this confirms the ECU answers extended addresses — what E-params + immo logging need.
+    static void ExtendedAddrCheck(uint chanId, string defsPath, string romId)
+    {
+        Log("");
+        Log("── Extended-address (E-param) read test ─────────────────────────────");
+        Log("  (E-params + immo registers live at 0x02xxxx/0xFFxxxx — confirm those answer)");
+        if (defsPath == null || !File.Exists(defsPath)) { Log("    (no defs — skipping)"); return; }
+        string[] lines = File.ReadAllLines(defsPath);
+        string name = null; bool wantAddr = false; int tested = 0, ok = 0;
+        for (int i = 0; i < lines.Length && tested < 4; i++)
+        {
+            string line = lines[i];
+            if (line.IndexOf("<ecuparam ") >= 0) { name = Attr(line, "name"); wantAddr = false; continue; }
+            if (line.IndexOf("<ecu ") >= 0) { string id = Attr(line, "id"); wantAddr = (id != null && id.IndexOf(romId) >= 0); continue; }
+            if (wantAddr && line.IndexOf("<address") >= 0)
+            {
+                wantAddr = false;
+                string lenS = Attr(line, "length"); int len = 1; if (lenS != null) int.TryParse(lenS, out len);
+                int gt = line.IndexOf('>', line.IndexOf("<address"));
+                int lt = gt >= 0 ? line.IndexOf('<', gt + 1) : -1;
+                if (gt < 0 || lt <= gt) continue;
+                string addrHex = line.Substring(gt + 1, lt - gt - 1).Trim();
+                byte[] baseA; try { baseA = ParseAddr(addrHex); } catch { continue; }
+                tested++;
+                byte[] data = ReadAddrs(chanId, ConsecAddrs(baseA, len));
+                if (data != null) ok++;
+                Log(string.Format("    {0,-34} @ {1} (len {2}) -> {3}",
+                    Trunc(name, 34), addrHex, len, data != null ? "OK raw " + Hex(data) : "NO RESPONSE"));
+            }
+        }
+        if (tested == 0) Log("    (no ecuparam addresses found for ROM " + romId + ")");
+        else Log("    -> " + ok + "/" + tested + " extended-address reads succeeded.");
+    }
+
+    // ITEM 3 — read the firmware's 12 default-profile params at their real defs addresses.
+    class PInfo { public string name, addrHex; public int len = 1, byteIdx, bit; public bool hasCap; }
+
+    static PInfo LookupParam(string[] lines, string id)
+    {
+        PInfo pi = null; bool inParam = false;
+        foreach (string line in lines)
+        {
+            if (line.IndexOf("</protocol>") >= 0) break;          // SSM section only
+            if (!inParam)
+            {
+                if (line.IndexOf("<parameter ") >= 0 && Attr(line, "id") == id)
+                {
+                    pi = new PInfo(); pi.name = Attr(line, "name");
+                    string bi = Attr(line, "ecubyteindex"), bt = Attr(line, "ecubit");
+                    pi.hasCap = (bi != null && bt != null && int.TryParse(bi, out pi.byteIdx) && int.TryParse(bt, out pi.bit));
+                    inParam = true;
+                }
+            }
+            else
+            {
+                if (pi.addrHex == null && line.IndexOf("<address") >= 0)
+                {
+                    string lenS = Attr(line, "length"); if (lenS != null) int.TryParse(lenS, out pi.len);
+                    int gt = line.IndexOf('>', line.IndexOf("<address"));
+                    int lt = gt >= 0 ? line.IndexOf('<', gt + 1) : -1;
+                    if (gt >= 0 && lt > gt) pi.addrHex = line.Substring(gt + 1, lt - gt - 1).Trim();
+                }
+                if (line.IndexOf("</parameter>") >= 0) break;
+            }
+        }
+        return pi;
+    }
+
+    static void DefaultParamCheck(uint chanId, string defsPath, byte[] initResp)
+    {
+        Log("");
+        Log("── Default-profile params (firmware's 12 enabled-by-default) ─────────");
+        if (defsPath == null || !File.Exists(defsPath)) { Log("    (no defs — skipping)"); return; }
+        string[] lines = File.ReadAllLines(defsPath);
+        string[] basic = { "P8", "P2", "P9", "P7", "P11", "P10", "P12", "P13", "P3", "P4", "P14", "P17" };
+        int sup = 0, okRead = 0;
+        foreach (string id in basic)
+        {
+            PInfo pi = LookupParam(lines, id);
+            if (pi == null) { Log(string.Format("    {0,-5} (not in defs)", id)); continue; }
+            bool supported = !pi.hasCap || (initResp != null && (5 + pi.byteIdx) < initResp.Length && (initResp[5 + pi.byteIdx] & (1 << pi.bit)) != 0);
+            string status;
+            if (!supported) status = "NOT supported by ECU (firmware skips it)";
+            else
+            {
+                sup++;
+                if (pi.addrHex == null) status = "supported (no SSM address)";
+                else
+                {
+                    byte[] data = ReadAddrs(chanId, ConsecAddrs(ParseAddr(pi.addrHex), pi.len));
+                    if (data != null) { okRead++; status = "OK  @ " + pi.addrHex + " raw " + Hex(data); }
+                    else status = "@ " + pi.addrHex + " -> NO RESPONSE";
+                }
+            }
+            Log(string.Format("    {0,-5} {1,-26} {2}", id, Trunc(pi.name, 26), status));
+        }
+        Log("    -> " + sup + "/12 supported, " + okRead + " read OK.");
+    }
+
+    // Switch (S-param) read — the T_BIT logging path: read the byte= address, extract bit=.
+    static void SwitchCheck(uint chanId, string defsPath, byte[] initResp)
+    {
+        Log("");
+        Log("── Switch (S-param) read test ───────────────────────────────────────");
+        Log("  (bit-flags the firmware logs via T_BIT — validates that path)");
+        if (defsPath == null || !File.Exists(defsPath)) { Log("    (no defs — skipping)"); return; }
+        string[] lines = File.ReadAllLines(defsPath);
+        int shown = 0, ok = 0;
+        foreach (string line in lines)
+        {
+            if (line.IndexOf("</protocol>") >= 0) break;       // SSM section only
+            if (line.IndexOf("<switch ") < 0) continue;
+            if (shown >= 12) break;
+            string addrS = Attr(line, "byte"), bitS = Attr(line, "bit"), biS = Attr(line, "ecubyteindex");
+            if (addrS == null || bitS == null) continue;
+            int bit; if (!int.TryParse(bitS, out bit)) continue;
+            int bi = -1; if (biS != null) int.TryParse(biS, out bi);
+            bool sup = bi < 0 || (initResp != null && (5 + bi) < initResp.Length && (initResp[5 + bi] & (1 << bit)) != 0);
+            if (!sup) continue;
+            shown++;
+            byte[] d; try { d = ReadAddrs(chanId, new byte[][] { ParseAddr(addrS) }); } catch { continue; }
+            if (d == null) { Log(string.Format("    {0,-5} {1,-30} read FAIL @ {2}", Attr(line, "id"), Trunc(Attr(line, "name"), 30), addrS)); continue; }
+            ok++;
+            int state = (d[0] >> bit) & 1;
+            Log(string.Format("    {0,-5} {1,-30} = {2}   ({3} bit {4}, byte {5:X2})",
+                Attr(line, "id"), Trunc(Attr(line, "name"), 30), state, addrS, bit, d[0]));
+        }
+        if (shown == 0) Log("    (no supported switches found for this ECU)");
+        else Log("    -> " + ok + "/" + shown + " switches read OK — T_BIT path validated.");
+    }
+
+    // ITEM 4 — continuous fast-poll: ECU streams 0xA8 responses without re-request.
+    static void ContinuousTest(uint chanId)
+    {
+        Log("");
+        Log("── Continuous fast-poll mode (0xA8 flag=1) ──────────────────────────");
+        Log("  (ECU streams without re-request; measures the max achievable sample rate)");
+        byte[][] addrs = { Addr(0x0E), Addr(0x0F), Addr(0x08) };   // RPM (2 bytes) + coolant
+        Send(chanId, BuildBatchRead(addrs, true));
+        int got = 0; long prev = 0; double sum = 0, min = 1e9, max = 0;
+        for (int i = 0; i < 12; i++)
+        {
+            byte[] r = Recv(chanId, 1000);
+            long t = Stopwatch.GetTimestamp();
+            if (r == null) break;
+            if (got > 0) { double dt = Ticks2Ms(t - prev); sum += dt; if (dt < min) min = dt; if (dt > max) max = dt; }
+            prev = t; got++;
+        }
+        // Stop the stream: a single (flag=0) read returns the ECU to single-response mode.
+        Send(chanId, BuildBatchRead(addrs, false)); Recv(chanId, 1000);
+        if (got >= 3)
+        {
+            double mean = sum / (got - 1);
+            Log(string.Format("    streamed {0} responses; period mean {1:F1} ms (min {2:F1}, max {3:F1})", got, mean, min, max));
+            Log(string.Format("    -> continuous rate ~{0:F0} Hz (vs ~17 Hz single-poll) for {1} addrs", 1000.0 / mean, addrs.Length));
+        }
+        else Log("    ECU did not stream — continuous mode unsupported here; single-poll still works.");
     }
 
     // ── SSM packet builders ──────────────────────────────────────────────────

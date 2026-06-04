@@ -25,12 +25,17 @@
 #define SSM_BAUD             4800   // K-Line / SSM — Serial1 (pins 0 RX / 1 TX)
 
 // -- SSM timing --
-// PHASE1_RETRY_MS: placeholder — update after SsmInitTiming.exe run on car
-// floor ~155ms (12.5ms TX + 12.5ms echo + ~129ms for ~62-byte response); 300ms buffers
-#define PHASE1_RETRY_MS            300    // ms to wait for init response first byte
+// Measured on ECU A210112F12 via SsmInitTiming.exe (2026-06-03):
+//   init round-trip ~148ms (12.5ms TX + ~6ms ECU start-gap + ~129ms for a 62-byte
+//   response); batch(3-addr) round-trip ~59ms; inter-byte gap ~2ms.
+// All read timeouts below are kept FAR above these floors ON PURPOSE so that slower
+// or different ECUs have ample margin (do NOT tune down to this car's numbers):
+//   init  first-byte = PHASE1_RETRY_MS (300ms)   init  inter-byte = 100ms (~line 277)
+//   batch first-byte = PHASE2_WATCHDOG_MS (5s)    batch inter-byte = 200ms (~line 380)
+#define PHASE1_RETRY_MS            300    // init response first-byte timeout (floor ~18ms; big buffer)
 #define PHASE1_SEARCH_DURATION_MS  120000 // 2 min of fast retries before sleeping (PHASE1_SEARCH)
 #define PHASE1_IDLE_SLEEP_MS       120000 // 2 min sleep between retries when parked (PHASE1_IDLE)
-#define PHASE2_WATCHDOG_MS         5000   // ms without streaming data → close log, re-enter PHASE1_SEARCH
+#define PHASE2_WATCHDOG_MS         5000   // no streaming data → close log, re-enter SEARCH (floor ~181ms; big buffer)
 
 // -- SD write performance --
 #define WRITE_BUF_SIZE       512    // CSV write buffer; matches SD sector size
@@ -50,6 +55,11 @@
 #define MAX_BATCH_DATA       192    // worst-case data bytes per batch response (MAX_FETCH×4)
 #define MAX_SSM_ADDR         84     // SSM single-request address limit: (255-2)/3 = 84
                                     // (one address per data byte; ECU returns 1 byte/address)
+                                    // NOTE: this is the PROTOCOL/array bound. The real
+                                    // operational limit is g_maxBatchAddrs (probed per-ECU).
+#define SSM_BATCH_DEFAULT    32     // fallback per-request address cap if the probe fails
+#define SSM_BATCH_MARGIN      2     // safety margin subtracted from the probed maximum
+#define CACHE_HEADER_LINES    5     // address_map.csv header lines: DEBUG,ECU,DEFS,BATCHMAX,columns
 #define MAX_EXPR_LEN         96     // max chars in a formula expr= (OBD if() exprs reach ~71)
 #define MAX_NAME_LEN         48     // max characters in a param name
 #define MAX_ID_LEN           24     // max characters in a param ID (e.g. E_IMMO_4AD9_4ADB)
@@ -178,6 +188,11 @@ char     g_defsFilename[40] = {0};
 // Allocate 96 for headroom.
 uint8_t  g_ecuInitRaw[96];
 uint8_t  g_ecuInitLen  = 0;   // rawResp[3] - 1  (data bytes minus the 0xFF command byte)
+
+// Per-ECU SSM batch-read address ceiling. Probed once when the cache is (re)built,
+// cached in the address_map.csv BATCHMAX= header, and reloaded on cache hit (no re-probe).
+// Selections exceeding this drop their highest-numbered params (logged to status.log).
+uint8_t  g_maxBatchAddrs = SSM_BATCH_DEFAULT;
 
 // Batch request packet (built once per engine start; reused every poll).
 // Sized for one 3-byte address per data byte (multi-byte params expand to
@@ -330,7 +345,7 @@ static void ssmBuildBatchRequest(uint8_t pollFlag) {
     //
     // Packet: 80 10 F0 <len_byte> A8 <pollFlag> <addr×3 each> <cs>
     // len_byte = (#addresses)*3 + 2  (cmd A8 + pollFlag + all address bytes)
-    // #addresses == g_numDataBytes (capped at MAX_SSM_ADDR=84 by buildFetchList).
+    // #addresses == g_numDataBytes (capped at g_maxBatchAddrs by buildFetchList).
     uint8_t lenByte = (uint8_t)(g_numDataBytes * 3 + 2);
     uint8_t idx = 0;
     g_batchReq[idx++] = 0x80;
@@ -392,6 +407,58 @@ static bool ssmReadBatchResponse(uint8_t *data, uint32_t timeoutMs) {
     // Copy data bytes (buf[5..5+N-1]) to caller's buffer
     memcpy(data, buf + 5, g_numDataBytes);
     return true;
+}
+
+// ---- Probe max batch size ----
+
+// Probe the largest single 0xA8 read this ECU answers, by sending stepped requests of
+// dummy low addresses (0x0000xx) and checking for a valid response. Returns the usable
+// cap = (largest that answered) - SSM_BATCH_MARGIN, or SSM_BATCH_DEFAULT if none answer.
+// Run only on cache regen (ECU connected); the result is cached in the BATCHMAX= header.
+static uint8_t ssmProbeMaxBatch() {
+    static const uint8_t steps[] = { 8, 16, 24, 32, 36, 40, 44, 48 };
+    uint8_t lastOk = 0;
+    for (uint8_t s = 0; s < sizeof(steps); s++) {
+        uint8_t n = steps[s];
+        // Request: 80 10 F0 <n*3+2> A8 00 <0x0000xx × n> <cs>
+        uint8_t req[160];
+        uint8_t idx = 0;
+        req[idx++] = 0x80; req[idx++] = 0x10; req[idx++] = 0xF0;
+        req[idx++] = (uint8_t)(n * 3 + 2); req[idx++] = 0xA8; req[idx++] = 0x00;
+        for (uint8_t a = 0; a < n; a++) { req[idx++] = 0x00; req[idx++] = 0x00; req[idx++] = a; }
+        req[idx] = ssmChecksum(req, idx + 1);
+        uint8_t reqLen = idx + 1;
+
+        Serial1.write(req, reqLen);
+        Serial1.flush();
+        ssmDiscardEcho(reqLen);
+
+        // Response: 80 F0 10 <n+1> E8 <n bytes> <cs> = n+6 bytes
+        uint8_t totalLen = (uint8_t)(n + 6);
+        uint8_t buf[64];
+        bool ok = true;
+        int b = ssmReadByte(300);
+        if (b < 0) ok = false; else buf[0] = (uint8_t)b;
+        for (uint8_t i = 1; ok && i < totalLen; i++) {
+            b = ssmReadByte(200);
+            if (b < 0) ok = false; else buf[i] = (uint8_t)b;
+        }
+        if (ok && (buf[0] != 0x80 || buf[1] != 0xF0 || buf[2] != 0x10 ||
+                   buf[3] != (uint8_t)(n + 1) || buf[4] != 0xE8)) ok = false;
+        if (ok && buf[totalLen - 1] != ssmChecksum(buf, totalLen)) ok = false;
+
+        if (!ok) break;          // first failure = ceiling found
+        lastOk = n;
+        delay(30);
+    }
+
+    uint8_t cap;
+    if (lastOk == 0)                      cap = SSM_BATCH_DEFAULT;   // ECU never answered → safe default
+    else if (lastOk > SSM_BATCH_MARGIN)   cap = (uint8_t)(lastOk - SSM_BATCH_MARGIN);
+    else                                  cap = lastOk;
+    if (cap > MAX_SSM_ADDR) cap = MAX_SSM_ADDR;
+    if (cap > MAX_FETCH)    cap = MAX_FETCH;
+    return cap;
 }
 
 // ---- Decode a raw fetch slot into a float engineering value ----
@@ -948,6 +1015,7 @@ bool parseProfile(const char *path) {
 //   DEBUG=false                          <- user-editable verbose-debug toggle
 //   ECU=2F12515506
 //   DEFS=logger_IMP_EN_v370.xml
+//   BATCHMAX=38                          <- probed per-ECU SSM batch-read address cap
 //   param_id,name,address,len,type,endian,expr,units,deps
 //   P7,Manifold Pressure,0x00000D,1,u8,big,x/100,bar,
 //   P7,Manifold Pressure,0x00000D,1,u8,big,x*37/255,psi,
@@ -1360,9 +1428,9 @@ DateTime queryRTC();                                          // RTC OPS
 bool regenCache();                                           // SD OPS
 
 // Read address_map.csv header lines.
-// Header order: DEBUG= , ECU= , DEFS= , then the column header.
+// Header order: DEBUG= , ECU= , DEFS= , BATCHMAX= , then the column header.
 // Returns: 0 = file missing/old format, 1 = ROM ID mismatch, 2 = DEFS mismatch, 3 = OK.
-// Side effect: sets g_verboseDebug from the DEBUG= line.
+// Side effects: sets g_verboseDebug from DEBUG=, and g_maxBatchAddrs from BATCHMAX=.
 uint8_t checkCacheHeaders() {
     SdFile f;
     if (!f.open(ADDR_MAP_FILE, O_READ)) return 0;
@@ -1388,7 +1456,19 @@ uint8_t checkCacheHeaders() {
     if (strncmp(line, "DEFS=", 5) != 0) { f.close(); return 0; }
     if (strcmp(line+5, g_defsFilename) != 0) { f.close(); return 2; }
 
-    // Line 4: column header — validates the cache FORMAT. An old-format cache (no
+    // Line 4: BATCHMAX=N — the per-ECU probed batch cap (cached so boots don't re-probe).
+    // Missing on old-format caches → treated as missing → regen (which re-probes).
+    if (f.fgets(line, sizeof(line)) <= 0) { f.close(); return 0; }
+    line[strcspn(line, "\r\n")] = '\0';
+    if (strncmp(line, "BATCHMAX=", 9) != 0) { f.close(); return 0; }
+    {
+        int v = atoi(line + 9);
+        if (v < 1) v = SSM_BATCH_DEFAULT;
+        if (v > MAX_SSM_ADDR) v = MAX_SSM_ADDR;
+        g_maxBatchAddrs = (uint8_t)v;
+    }
+
+    // Line 5: column header — validates the cache FORMAT. An old-format cache (no
     // units column) has the same DEBUG/ECU/DEFS but a different column header, so
     // this check forces a regen to the new format.
     if (f.fgets(line, sizeof(line)) <= 0) { f.close(); return 0; }
@@ -1414,9 +1494,9 @@ bool loadCacheForSelected() {
 
         char line[LINE_BUF_SIZE];
         bool hit = false;
-        // Skip 4 header lines (DEBUG=, ECU=, DEFS=, column header)
+        // Skip header lines (DEBUG=, ECU=, DEFS=, BATCHMAX=, column header)
         bool headersOk = true;
-        for (uint8_t h = 0; h < 4; h++) {
+        for (uint8_t h = 0; h < CACHE_HEADER_LINES; h++) {
             if (f.fgets(line, LINE_BUF_SIZE) <= 0) { headersOk = false; break; }
         }
         if (!headersOk) { f.close(); return false; }
@@ -1510,7 +1590,7 @@ static bool cacheHasEParams() {
     SdFile f;
     if (!f.open(ADDR_MAP_FILE, O_READ)) return false;
     char line[LINE_BUF_SIZE];
-    for (uint8_t h = 0; h < 4; h++) { if (f.fgets(line, sizeof(line)) <= 0) { f.close(); return false; } }
+    for (uint8_t h = 0; h < CACHE_HEADER_LINES; h++) { if (f.fgets(line, sizeof(line)) <= 0) { f.close(); return false; } }
     bool hasE = false;
     while (f.fgets(line, sizeof(line)) > 0) { if (line[0] == 'E') { hasE = true; break; } }
     f.close();
@@ -1524,7 +1604,7 @@ static void emitProfileSection(SdFile &pf, char mode) {
     SdFile f;
     if (!f.open(ADDR_MAP_FILE, O_READ)) return;
     char line[LINE_BUF_SIZE];
-    for (uint8_t h = 0; h < 4; h++) f.fgets(line, sizeof(line));   // skip headers
+    for (uint8_t h = 0; h < CACHE_HEADER_LINES; h++) f.fgets(line, sizeof(line));   // skip headers
     char lastId[MAX_ID_LEN] = {0};
     char id[MAX_ID_LEN], name[MAX_NAME_LEN], units[32], buf[LINE_BUF_SIZE];
     while (f.fgets(line, sizeof(line)) > 0) {
@@ -1692,8 +1772,8 @@ static bool loadDepFromCache(const char *depId) {
     if (!f.open(ADDR_MAP_FILE, O_READ)) return false;
 
     char line[LINE_BUF_SIZE];
-    // Skip 4 header lines (DEBUG=, ECU=, DEFS=, column header)
-    for (uint8_t h = 0; h < 4; h++) {
+    // Skip header lines (DEBUG=, ECU=, DEFS=, BATCHMAX=, column header)
+    for (uint8_t h = 0; h < CACHE_HEADER_LINES; h++) {
         if (f.fgets(line, LINE_BUF_SIZE) <= 0) { f.close(); return false; }
     }
 
@@ -1755,6 +1835,14 @@ static bool loadDepFromCache(const char *depId) {
 
 // ---- Build fetch list ----
 
+// Numeric portion of a param id ("P119"→119, "E83"→83, "S13"→13). Used to order the
+// batch-cap drop: highest-numbered params are dropped first. No digits → 0 (kept).
+static uint16_t paramNumId(const char *id) {
+    const char *p = id;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    return *p ? (uint16_t)atoi(p) : 0;
+}
+
 // Populate g_fetch[] from g_sel[], including hidden dep params for T_CALC entries.
 // Order: (1) resolve dep params into g_sel[] as hidden entries;
 //        (2) assign fetch slots for all non-CALC/non-NONE params;
@@ -1771,12 +1859,30 @@ void buildFetchList() {
             loadDepFromCache(depIds[d]);
     }
 
-    // Step 2: assign fetch slots for all params (including newly-loaded hidden deps).
-    // totalBytes tracks the SSM response data byte count = number of addresses in the
-    // request (multi-byte params expand to consecutive addresses).
+    // Step 2: assign fetch slots. Process in ASCENDING numeric-ID order so that when the
+    // per-ECU batch cap (g_maxBatchAddrs, probed) is reached, the HIGHEST-numbered params
+    // overflow and are dropped (fetchIdx=FETCH_NONE → log 0.00). g_sel[] is NOT reordered,
+    // so the CSV column order stays exactly as listed in logger.xml.
+    uint8_t order[MAX_SELECTED];
+    for (uint8_t i = 0; i < g_numSel; i++) order[i] = i;
+    for (uint8_t a = 1; a < g_numSel; a++) {              // insertion sort by numeric id
+        uint8_t key = order[a];
+        uint16_t kn = paramNumId(g_sel[key].id);
+        int8_t b = (int8_t)a - 1;
+        while (b >= 0 && paramNumId(g_sel[order[b]].id) > kn) { order[b + 1] = order[b]; b--; }
+        order[b + 1] = key;
+    }
+
+    // totalBytes = SSM response data byte count = #addresses (multi-byte params expand to
+    // consecutive addresses). cap = per-ECU probed limit for SSM; array bound for OBD.
+    uint8_t  cap = (g_protocol == PROTO_SSM) ? g_maxBatchAddrs : MAX_FETCH;
     g_numFetch = 0;
     uint16_t totalBytes = 0;
-    for (uint8_t i = 0; i < g_numSel; i++) {
+    uint8_t  dropCount = 0;
+    char     dropList[64]; dropList[0] = '\0';
+
+    for (uint8_t oi = 0; oi < g_numSel; oi++) {
+        uint8_t i = order[oi];
         if (g_sel[i].ptype == T_NONE || g_sel[i].ptype == T_CALC) {
             g_sel[i].fetchIdx = FETCH_NONE;
             continue;
@@ -1785,27 +1891,34 @@ void buildFetchList() {
         uint8_t existing = FETCH_NONE;
         for (uint8_t j = 0; j < g_numFetch; j++) {
             if (g_fetch[j].address == g_sel[i].address &&
-                g_fetch[j].len     == g_sel[i].len) {
-                existing = j; break;
-            }
+                g_fetch[j].len     == g_sel[i].len) { existing = j; break; }
         }
-        if (existing != FETCH_NONE) {
-            g_sel[i].fetchIdx = existing;
-        } else {
-            // Overflow guards: max slots, and (SSM only) the per-request address limit.
-            // A param that can't fit gets fetchIdx=FETCH_NONE → logs 0.00.
-            if (g_numFetch >= MAX_FETCH ||
-                (g_protocol == PROTO_SSM && totalBytes + g_sel[i].len > MAX_SSM_ADDR)) {
-                g_sel[i].fetchIdx = FETCH_NONE;
-                continue;
+        if (existing != FETCH_NONE) { g_sel[i].fetchIdx = existing; continue; }
+
+        // Overflow: array slots exhausted OR per-ECU batch cap reached → drop this param
+        // (we're in ascending-id order, so the highest-numbered ones land here first).
+        if (g_numFetch >= MAX_FETCH || totalBytes + g_sel[i].len > cap) {
+            g_sel[i].fetchIdx = FETCH_NONE;
+            if (!g_sel[i].hidden) {                       // only report user-selected drops
+                dropCount++;
+                size_t dl = strlen(dropList);
+                snprintf(dropList + dl, sizeof(dropList) - dl, "%s%s", dl ? "," : "", g_sel[i].id);
             }
-            g_fetch[g_numFetch].address = g_sel[i].address;
-            g_fetch[g_numFetch].len     = g_sel[i].len;
-            g_fetch[g_numFetch].dataOff = 0;
-            g_sel[i].fetchIdx = g_numFetch;
-            g_numFetch++;
-            totalBytes += g_sel[i].len;
+            continue;
         }
+        g_fetch[g_numFetch].address = g_sel[i].address;
+        g_fetch[g_numFetch].len     = g_sel[i].len;
+        g_fetch[g_numFetch].dataOff = 0;
+        g_sel[i].fetchIdx = g_numFetch;
+        g_numFetch++;
+        totalBytes += g_sel[i].len;
+    }
+
+    // Tell the user (via status.log) if the selection exceeded this ECU's batch ceiling.
+    if (dropCount > 0) {
+        char det[96];
+        snprintf(det, sizeof(det), "cap=%u dropped=%u (%s)", cap, dropCount, dropList);
+        writeStatusLog("BATCH_LIMIT", det);
     }
 
     // SSM: build the batch request packet now (OBD polls per-PID in the streaming loop)
@@ -1924,6 +2037,16 @@ bool regenCache() {
         return false;
     }
 
+    // Probe this ECU's max batch-read size ONCE (here, on regen) and cache it in the
+    // BATCHMAX= header so normal boots (cache hit) reload it without re-probing. SSM
+    // only — OBD polls per-PID and has no batch limit, so it keeps the default.
+    if (g_protocol == PROTO_SSM) {
+        g_maxBatchAddrs = ssmProbeMaxBatch();
+        char det[40];
+        snprintf(det, sizeof(det), "max=%u addresses", g_maxBatchAddrs);
+        writeStatusLog("BATCH_PROBE", det);
+    }
+
     // Write header lines. DEBUG= is ALWAYS written false on creation/regeneration —
     // the user edits it to true manually when they want verbose tracing. (A user's
     // DEBUG=true does NOT survive a cache regen; they re-enable it after regen.)
@@ -1932,6 +2055,8 @@ bool regenCache() {
     snprintf(hdr, sizeof(hdr), "ECU=%s\n", g_romId);
     cf.print(hdr);
     snprintf(hdr, sizeof(hdr), "DEFS=%s\n", g_defsFilename);
+    cf.print(hdr);
+    snprintf(hdr, sizeof(hdr), "BATCHMAX=%u\n", g_maxBatchAddrs);
     cf.print(hdr);
     cf.print(F("param_id,name,address,len,type,endian,expr,units,deps\n"));
 
