@@ -11,6 +11,3 @@ desktop.ini
 
 # macOS
 .DS_Store
-
-# Compiled tools (binaries tracked separately via releases)
-tools/*.exe
