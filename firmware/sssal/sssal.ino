@@ -9,15 +9,23 @@
 
 #include <SdFat.h>
 #include <RTClib.h>
-#include <Arduino_CAN.h>      // RA4M1 CAN FD — used for OBD protocol (pins D4/D5)
+#include <Arduino_CAN.h>      // RA4M1 built-in CAN — for SSM-over-CAN (future/stub, pins D4/D5)
 #include <math.h>            // fmodf() for the % operator in the expression evaluator
 
 // ============================================================
 // === CONFIG ===
 // ============================================================
 
+// -- Hardware wiring map (Arduino Uno R4 Minima) --
+//   SD + DS1307 RTC : HiLetgo Data Logger Shield over SPI; SD CS = D10, RTC on I2C (A4/A5).
+//   K-line (SSM)    : TJA1020 / MC33660 transceiver — Serial1 D0(RX)/D1(TX) <-> OBD-II pin 7.  [ACTIVE]
+//   CAN (SSM/CAN)   : SN65HVD230 / TJA1050 transceiver — D4(CANRX)/D5(CANTX) <-> OBD-II pins
+//                     6(CAN-H)/14(CAN-L). Built-in RA4M1 controller.                          [FUTURE/STUB]
+//   Status LED      : LED_BUILTIN (D13).
+//   Power           : OBD-II pin 16 (+12V) / pins 4,5 (GND) via a 12V->5V supply.
+//
 // -- Hardware pins --
-#define SD_CS_PIN            10     // HiLetgo logger shield SD chip select (SPI)
+#define SD_CS_PIN            10     // logger shield SD chip select (SPI)
 // LED_BUILTIN = 13                 // already defined by R4 Minima board package
 
 // -- Baud rates --
@@ -96,8 +104,8 @@
 #define END_LITTLE 1
 
 // --- Protocol constants ---
-#define PROTO_SSM  0
-#define PROTO_OBD  1   // ISO 15765 CAN — requires TJA1050 on D4/D5, 500kbps
+#define PROTO_SSM  0   // SSM over K-line (Serial1, 4800 8N1) — the implemented transport
+#define PROTO_CAN  1   // SSM-over-CAN (ISO15765 @500k, IDs 0x7E0/0x7E8) — FUTURE, stubbed (see SSM-over-CAN section)
 
 // --- Phase constants ---
 #define PHASE_SEARCH    0   // fast retry loop (up to 2 min)
@@ -183,10 +191,11 @@ bool     g_haveLoggerXml = false;
 // Definitions filename detected on SD (e.g. "logger_IMP_EN_v370.xml")
 char     g_defsFilename[40] = {0};
 
-// ECU init response raw buffer — kept during cache regen for capability checks
-// Max practical size: 4 header + 1 cmd + 3 reserved + 5 romId + 69 cap + 1 cs = 83 bytes
-// Allocate 96 for headroom.
-uint8_t  g_ecuInitRaw[96];
+// ECU init response raw buffer — kept during cache regen for capability checks.
+// A 96-flagbyte ECU sends the largest response: 4 hdr + 1 cmd + 3 reserved + 5 romId
+// + 96 cap + 1 cs = 110 bytes. Allocate 112 so those ECUs aren't rejected (48-flagbyte
+// EJ255 = 62 bytes; this only matters for newer 6-cyl / high-feature ECUs).
+uint8_t  g_ecuInitRaw[112];
 uint8_t  g_ecuInitLen  = 0;   // rawResp[3] - 1  (data bytes minus the 0xFF command byte)
 
 // Per-ECU SSM batch-read address ceiling. Probed once when the cache is (re)built,
@@ -550,54 +559,40 @@ static float ssmDecodeSlot(const uint8_t *data, uint8_t dataOff,
     return evalExpr(expr, x);
 }
 
-// ---- OBD / ISO 15765 CAN functions ----
-// Hardware: TJA1050 on D4 (CANRX) / D5 (CANTX), 500kbps.
-// OBD request: CAN ID 0x7E0, data = [0x02, mode, PID, 0x55 × 5]
-// OBD response: CAN ID 0x7E8, data = [len, mode+0x40, PID, A, B, C, D]
-// 'A'=data[3], 'B'=data[4], 'C'=data[5], 'D'=data[6] match formula variables.
+// ---- SSM-over-CAN (ISO15765) — FUTURE TRANSPORT, currently STUBBED ----
+// Hardware: CAN transceiver (SN65HVD230 / TJA1050) on D4 (CANRX) / D5 (CANTX) @ 500 kbps,
+// to OBD-II pins 6 (CAN-H) / 14 (CAN-L). The R4 Minima's RA4M1 has the CAN controller built in.
+//
+// SSM-over-CAN carries the SAME SSM command/data model as K-line — only the transport differs,
+// so the parser/defs/capability/fetch pipeline is reused unchanged; only TX/RX framing is new.
+// Byte-exact spec (pinned from RomRaider io/protocol/ssm/iso15765/SSMProtocol.java, 2026-06-15):
+//   Transport : ISO15765 (ISO-TP) @ 500 kbps. ECU req CAN-ID 0x7E0 / resp 0x7E8 (TCU 0x7E1/0x7E9).
+//               NO checksum, NO 80/10/F0 header (CAN-ID carries addressing, CAN-CRC carries integrity).
+//   Requests  : Init = AA ; Read N addrs = A8 00 <a1(3)>..<aN(3)> ; Write = B8 <addr(3)> <val>.
+//               A0 block-read and B0 block-write are NOT supported on CAN — A8/B8 only.
+//   Responses : Init = EA <SSM-ID 3B> <ECU-ID 5B> <cap bytes> (SAME capability bitmap as K-line) ;
+//               Read = E8 <data> ; Write = F8 <echo> ; Error = 7F <cmd> <code> (13=len, 22=addr).
+//   Polling   : MUST POLL — no continuous-stream/fast-poll over CAN (re-send A8 each cycle).
+//   ISO-TP    : payloads >7 bytes (init resp ~57B, multi-addr reads) need Single/First/Consecutive
+//               frames + Flow-Control. Implement the SF/FF/CF/FC subset (or an ISO-TP library);
+//               honor the ECU's FC STmin/BS. THIS is the main remaining work for the CAN path.
+//
+// NOT YET IMPLEMENTED. canProbe() returns false so PROTO_CAN never connects; the seam, the CAN
+// init, and this spec are in place for when SSM-over-CAN is built (see project_kline_logger.md
+// "SSM2-over-CAN (ISO15765) — BYTE-EXACT SPEC").
 
-// Initialise CAN FD peripheral at 500 kbps (standard OBD2 rate).
-// Returns true if hardware responds.
-static bool obdCanInit() {
+// Initialise the CAN peripheral at 500 kbps. Returns true if the controller started.
+static bool canBegin() {
     return (CAN.begin(CanBitRate::BR_500k) == 1);
 }
 
-// Send a mode-01 OBD PID request to 0x7E0.
-static void obdSendRequest(uint8_t pid) {
-    uint8_t d[8] = {0x02, 0x01, pid, 0x55, 0x55, 0x55, 0x55, 0x55};
-    CAN.write(CanMsg(CanStandardId(0x7E0), 8, d));
-}
-
-// Wait up to timeoutMs for a mode-01 response matching pid from ID 0x7E8.
-// Writes A/B/C/D (up to 4 data bytes) into out[0..3]. Returns true on success.
-static bool obdReadResponse(uint8_t pid, uint8_t *out, uint32_t timeoutMs) {
-    memset(out, 0, 4);
-    uint32_t start = millis();
-    while (millis() - start < timeoutMs) {
-        if (!CAN.available()) continue;
-        CanMsg msg = CAN.read();
-        // Expect response from ECU (0x7E8), service 01 response (0x41), matching PID
-        if ((uint32_t)msg.id == 0x7E8 && msg.data_length >= 3 &&
-            msg.data[1] == 0x41 && msg.data[2] == pid) {
-            for (uint8_t i = 0; i < 4 && (i + 3) < msg.data_length; i++)
-                out[i] = msg.data[3 + i];
-            return true;
-        }
-        // Ignore other CAN traffic (TPMS, body modules, etc.) and keep waiting
-    }
+// Probe an SSM-over-CAN ECU (init 0xAA → expect 0xEA). STUB: not implemented — returns false so
+// PROTO_CAN stays inert. When built, mirror ssmReadInitResponse over ISO-TP (strip the CAN-ID +
+// response code, fill g_romId / g_ecuInitRaw / g_ecuInitLen from the EA payload).
+static bool canProbe() {
+    // TODO(SSM-over-CAN): canBegin(); ISO-TP send AA to 0x7E0; reassemble the 0x7E8 response;
+    //   require response code == 0xEA; copy SSM-ID/ROM-ID/cap into g_romId + g_ecuInitRaw.
     return false;
-}
-
-// Probe the OBD ECU: send PID 0x00 (supported PIDs), wait for any response.
-// Sets g_romId to "OBD_GENERIC" on success.
-static bool obdProbe() {
-    obdSendRequest(0x00);
-    uint8_t resp[4];
-    if (!obdReadResponse(0x00, resp, PHASE1_RETRY_MS)) return false;
-    strncpy(g_romId, "OBD_GENERIC", sizeof(g_romId) - 1);
-    g_romId[sizeof(g_romId) - 1] = '\0';
-    g_ecuInitLen = 0;   // OBD capability checking not yet implemented; skip filtering
-    return true;
 }
 
 // ============================================================
@@ -814,17 +809,6 @@ float evalCalcExpr(const char *expr, bool *divZeroOut) {
     return result;
 }
 
-// Evaluate an OBD expr using raw bytes A/B/C/D from the CAN response.
-// NOTE: the RomRaider v370 definitions use 'x' (assembled value), NOT A/B/C/D,
-// so the OBD streaming path uses ssmDecodeSlot() instead and this function is
-// currently unused. Kept for definition files that DO use the A/B/C/D convention.
-float evalExprOBD(const char *expr, uint8_t A, uint8_t B, uint8_t C, uint8_t D) {
-    g_ep = expr; g_ex = 0.0f;
-    g_eA = (float)A; g_eB = (float)B; g_eC = (float)C; g_eD = (float)D;
-    g_divZero = false;
-    return epExpr();
-}
-
 // ============================================================
 // === XML PARSER ===
 // ============================================================
@@ -957,9 +941,9 @@ bool parseProfile(const char *path) {
         if (strstr(line, "<profile") && strstr(line, "protocol=")) {
             char proto[16];
             if (extractAttr(line, "protocol=", proto, sizeof(proto))) {
-                if (strcmp(proto, "OBD") == 0)       g_protocol = PROTO_OBD;
-                else if (strcmp(proto, "SSM") == 0)  g_protocol = PROTO_SSM;
-                // DS2 / NCS → also unsupported; detected below
+                if (strcmp(proto, "CAN") == 0)       g_protocol = PROTO_CAN;  // SSM-over-CAN (stub)
+                else if (strcmp(proto, "SSM") == 0)  g_protocol = PROTO_SSM;  // SSM K-line (default)
+                // anything else → left at the PROTO_SSM default
             }
         }
 
@@ -1257,8 +1241,9 @@ static void parseDefinitions(SdFile &cacheFile) {
     bool     wHasBit = false, wIsCalc = false, wHasLen = false;
     char     wCalcDeps[MAX_EXPR_LEN] = {0};
 
-    // Determine which protocol section to scan
-    const char *targetSection = (g_protocol == PROTO_OBD) ? "id=\"OBD\"" : "id=\"SSM\"";
+    // Both transports use the SSM param section — SSM-over-CAN differs only in framing,
+    // not in the addresses/conversions — so always scan the SSM section.
+    const char *targetSection = "id=\"SSM\"";
 
     while (df.fgets(line, LINE_BUF_SIZE) > 0) {
         // ---- IDLE: wait for target protocol section ----
@@ -1575,8 +1560,10 @@ bool loadCacheForSelected() {
 // ---- Auto-generated profiles (unknown / profile-less ECU) ----
 
 // The 12 basic P-params enabled by default in any generated profile.
+// P58 (A/F Sensor #1, wideband) is preferred over P14 (Front O2 #1, narrowband) for modern
+// turbo Subarus; the capability filter drops whichever the connected ECU doesn't support.
 static const char *BASIC_PARAMS[] = {
-    "P8","P2","P9","P7","P11","P10","P12","P13","P3","P4","P14","P17"
+    "P8","P2","P9","P7","P11","P10","P12","P13","P3","P4","P58","P17"
 };
 static bool isBasicParam(const char *id) {
     for (uint8_t i = 0; i < 12; i++)
@@ -1595,6 +1582,25 @@ static bool cacheHasEParams() {
     while (f.fgets(line, sizeof(line)) > 0) { if (line[0] == 'E') { hasE = true; break; } }
     f.close();
     return hasE;
+}
+
+// Count the ECU's supported P-params in the cache (unique P-prefix ids, excluding CALC) —
+// the same figure the pre-flight tool reports. Logged at detection for context.
+static uint16_t countSupportedPParams() {
+    SdFile f;
+    if (!f.open(ADDR_MAP_FILE, O_READ)) return 0;
+    char line[LINE_BUF_SIZE], id[MAX_ID_LEN], type[16], lastId[MAX_ID_LEN] = {0};
+    for (uint8_t h = 0; h < CACHE_HEADER_LINES; h++) f.fgets(line, sizeof(line));
+    uint16_t count = 0;
+    while (f.fgets(line, sizeof(line)) > 0) {
+        if (!csvField(line, 0, id, sizeof(id))) continue;
+        if (id[0] != 'P' || strcmp(id, lastId) == 0) continue;   // P-params only, dedup consecutive
+        strncpy(lastId, id, sizeof(lastId) - 1); lastId[sizeof(lastId) - 1] = '\0';
+        csvField(line, 4, type, sizeof(type));
+        if (strcmp(type, "calculated") != 0) count++;            // exclude CALC (match tool)
+    }
+    f.close();
+    return count;
 }
 
 // Emit one profile section by streaming the cache (dedup consecutive rows by id,
@@ -2396,6 +2402,13 @@ static void handleEcuFound() {
         loadCacheForSelected();   // second attempt; accept whatever state we get
     }
 
+    // Log how many P-params this ECU supports (capability-derived context).
+    {
+        char det[24];
+        snprintf(det, sizeof(det), "P-params=%u", (unsigned)countSupportedPParams());
+        writeStatusLog("ECU_SUPPORTED", det);
+    }
+
     // Build filename and open log file BEFORE incrementing counter.
     // Counter is only incremented if the file opens successfully — prevents
     // skipped session numbers on SD-full or other open failures.
@@ -2412,7 +2425,7 @@ static void handleEcuFound() {
     Serial.print(F("[LOG] ")); Serial.println(g_logFilename);
 
     buildFetchList();
-    if (g_protocol == PROTO_SSM) ssmSendBatchRequest();   // OBD polls per-PID in streaming loop
+    if (g_protocol == PROTO_SSM) ssmSendBatchRequest();   // K-line streams; CAN would poll per-cycle (stub)
 
     g_firstPacket = true;
     g_phase = PHASE_STREAMING;
@@ -2478,12 +2491,16 @@ void setup() {
     }
 
     // ---- Protocol check and hardware init ----
-    if (g_protocol == PROTO_OBD) {
-        if (!obdCanInit())
-            fatalHalt("CAN_INIT_FAIL", "CAN bus init failed — check TJA1050 on D4/D5");
-        Serial.println(F("[BOOT] CAN OK (OBD mode)"));
+    if (g_protocol == PROTO_CAN) {
+        // SSM-over-CAN seam is in place but the transport is not implemented yet (canProbe()
+        // returns false). Init the CAN controller so the seam is exercised; the probe simply
+        // never connects until SSM-over-CAN is built.
+        if (!canBegin())
+            fatalHalt("CAN_INIT_FAIL", "CAN controller init failed — check transceiver on D4/D5");
+        writeStatusLog("CAN_STUB", "SSM-over-CAN selected but not implemented yet (K-line only)");
+        Serial.println(F("[BOOT] CAN init OK — but SSM-over-CAN NOT IMPLEMENTED (stub)"));
     } else if (g_protocol != PROTO_SSM) {
-        fatalHalt("PROTO_NOT_SUPPORTED", "only SSM and OBD protocols are implemented");
+        fatalHalt("PROTO_NOT_SUPPORTED", "only SSM (K-line) is implemented");
         return;
     }
 
@@ -2498,6 +2515,18 @@ void setup() {
     Serial.print(F("[BOOT] profile OK: ")); Serial.print(g_numSel); Serial.println(F(" params"));
     Serial.print(F("[BOOT] defs: ")); Serial.println(g_defsFilename);
 
+    // ---- Consolidated boot self-test line (one glance on the first hardware run) ----
+    // SD is already proven (we got here), so this summarizes the other subsystems.
+    {
+        char st[64];
+        snprintf(st, sizeof(st), "SD=OK RTC=%s proto=%s sel=%u",
+                 g_rtcOk ? "OK" : "FAIL",
+                 g_protocol == PROTO_SSM ? "SSM-Kline" : "CAN-stub",
+                 g_numSel);
+        writeStatusLog("BOOT_SELFTEST", st);
+        Serial.print(F("[BOOT] selftest: ")); Serial.println(st);
+    }
+
     digitalWrite(LED_BUILTIN, HIGH);   // booted and ready
 
     // Enter Phase 1 detection
@@ -2511,12 +2540,12 @@ void setup() {
 static uint32_t g_searchStartMs = 0;
 
 // Probe the ECU using the current protocol.  Returns true if the ECU responded.
-// For SSM: sends init packet + reads init response (fills g_romId, g_ecuInitRaw).
-// For OBD: sends PID 0x00, waits for response, sets g_romId = "OBD_GENERIC".
+// For SSM (K-line): sends init packet + reads init response (fills g_romId, g_ecuInitRaw).
+// For CAN: SSM-over-CAN probe — STUBBED (canProbe() returns false until implemented).
 static bool protocolProbe() {
-    if (g_protocol == PROTO_OBD) return obdProbe();
+    if (g_protocol == PROTO_CAN) return canProbe();
     ssmSendInitPacket();
-    uint8_t rawResp[96]; uint8_t respLen = 0;
+    uint8_t rawResp[112]; uint8_t respLen = 0;   // 112 = room for a 96-flagbyte ECU (~110B)
     return ssmReadInitResponse(rawResp, sizeof(rawResp), &respLen);
 }
 
@@ -2598,32 +2627,13 @@ void loop() {
         float vals[MAX_SELECTED] = {0};
         bool timedOut = false;
 
-        if (g_protocol == PROTO_OBD) {
-            // OBD: send a CAN request and wait for a response per param individually.
-            // The RomRaider OBD section assembles the PID's data bytes into 'x'
-            // (big-endian, width per storagetype) and the expr operates on x — the
-            // SAME model as SSM — so we reuse ssmDecodeSlot on the response bytes.
-            // (A/B/C/D byte variables are NOT used by this definitions file.)
-            for (uint8_t i = 0; i < g_numSel && !timedOut; i++) {
-                if (g_sel[i].ptype == T_NONE || g_sel[i].ptype == T_CALC ||
-                    g_sel[i].fetchIdx == FETCH_NONE) {
-                    vals[i] = 0.0f;
-                    g_sel[i].lastVal = 0.0f;
-                    continue;
-                }
-                uint8_t pid = (uint8_t)(g_fetch[g_sel[i].fetchIdx].address & 0xFF);
-                obdSendRequest(pid);
-                uint8_t respBytes[4] = {0};   // A,B,C,D data bytes from the CAN frame
-                if (!obdReadResponse(pid, respBytes, 2000)) {
-                    timedOut = true;
-                    break;
-                }
-                vals[i] = ssmDecodeSlot(respBytes, 0, g_sel[i].len, g_sel[i].ptype,
-                                        g_sel[i].endian, g_sel[i].bitNum, g_sel[i].expr);
-                g_sel[i].lastVal = vals[i];
-                if (isRawHexType(g_sel[i].ptype))
-                    g_rawVals[i] = assembleRawInt(respBytes, 0, g_sel[i].len, g_sel[i].endian);
-            }
+        if (g_protocol == PROTO_CAN) {
+            // SSM-over-CAN streaming is NOT IMPLEMENTED yet — unreachable in practice (canProbe()
+            // returns false, so PROTO_CAN never enters PHASE_STREAMING). This is the seam where the
+            // ISO-TP poll loop will live: each cycle, ISO-TP send A8 + addr list, reassemble the
+            // 0x7E8 response, then decode via ssmDecodeSlot exactly like the SSM branch below.
+            (void)vals;
+            timedOut = true;   // force the watchdog → SEARCH if this is ever reached
         } else {
             // SSM: read one batch response (ECU is streaming continuously)
             uint8_t data[MAX_BATCH_DATA];
