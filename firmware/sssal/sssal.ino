@@ -2142,6 +2142,10 @@ static void closeLogFile() {
     g_logFile.truncate();
     g_logFile.sync();
     g_logFile.close();
+    // Orderly-close marker. A file whose name has NO matching LOG_CLOSED line in
+    // status.log ended on a power cut — its last CSV line may be truncated (data since
+    // the last 1 s sync is lost), so a parser should discard that file's final row.
+    writeStatusLog("LOG_CLOSED", g_logFilename);
 }
 
 // Periodic sync — call inside the streaming loop.
@@ -2597,6 +2601,20 @@ void setup() {
             g_rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
             writeStatusLog("RTC_SET", "compile time (RTC was unset)");
         }
+    }
+
+    // ---- RTC plausibility report (machine-readable) ----
+    // Since the filename and the FAT mtime now BOTH derive from the RTC, they agree even
+    // when the RTC is wrong — so emit an explicit validity signal to status.log instead.
+    // running = DS1307 oscillator running (CH bit clear); plausible = year in 2020..2040.
+    {
+        DateTime rn = queryRTC();
+        bool rtcRunning = g_rtcOk && g_rtc.isrunning();
+        bool rtcPlausible = (rn.year() >= 2020 && rn.year() <= 2040);
+        char rs[48];
+        snprintf(rs, sizeof(rs), "running=%d year=%u plausible=%d",
+                 rtcRunning ? 1 : 0, rn.year(), rtcPlausible ? 1 : 0);
+        writeStatusLog((rtcRunning && rtcPlausible) ? "RTC_OK" : "RTC_INVALID", rs);
     }
 
     // ---- Wire the RTC into SdFat so FAT directory timestamps (file created/modified
