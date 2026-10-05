@@ -11,6 +11,9 @@
 #include <RTClib.h>
 #include <Arduino_CAN.h>      // RA4M1 built-in CAN — for SSM-over-CAN (future/stub, pins D4/D5)
 #include <math.h>            // fmodf() for the % operator in the expression evaluator
+extern "C" {
+  #include "tusb.h"          // tud_mounted() + MSC device callbacks (USB Mass Storage mode)
+}
 
 // ============================================================
 // === CONFIG ===
@@ -26,6 +29,7 @@
 //
 // -- Hardware pins --
 #define SD_CS_PIN            10     // logger shield SD chip select (SPI)
+#define SLP_PIN              2      // LINTTL3 (TJA1021) transceiver sleep control — HIGH = awake
 // LED_BUILTIN = 13                 // already defined by R4 Minima board package
 
 // -- Baud rates --
@@ -2203,6 +2207,16 @@ DateTime queryRTC() {
     return g_rtc.now();
 }
 
+// SdFat date/time callback: stamps FAT directory entries (the "created/modified"
+// dates shown in Explorer) with the RTC time. Without it, SdFat uses its own default
+// epoch, so file-property dates don't match the RTC even though the filename (built
+// from queryRTC) does. Registered in setup() via FsDateTime::setCallback().
+static void sdDateTimeCallback(uint16_t *date, uint16_t *time) {
+    DateTime now = queryRTC();
+    *date = FS_DATE(now.year(), now.month(), now.day());
+    *time = FS_TIME(now.hour(), now.minute(), now.second());
+}
+
 
 // Read g_sessionNum from counter.txt.
 // Falls back to scanning logger/ for highest NNNN_ prefix (+1) or 1.
@@ -2434,12 +2448,102 @@ static void handleEcuFound() {
 // ============================================================
 // setup()
 // ============================================================
+// ============================================================
+// USB Mass Storage (SD-as-USB-drive)
+// Boot-time mode latch: if a USB host enumerates us (plugged into a PC),
+// run as a USB flash drive exposing the SD card — so logs can be copied off
+// and config files loaded WITHOUT removing the microSD. In the car (powered
+// from OBD 12V, no USB host) this never triggers → normal logger.
+// Requires core edits: variants/MINIMA/tusb_config.h CFG_TUD_MSC=1, and
+// cores/arduino/usb/USB.cpp USBD_MSD_IN_OUT_SIZE guarded to 64 for full-speed
+// (see project state file — both are WIPED on a core update, re-apply).
+// SD is accessed as a raw block device here (no FatVolume mounted) so the PC
+// owns the filesystem exclusively while plugged in — no dual-access corruption.
+// ============================================================
+bool       g_mscMode    = false;
+SdCard*    g_mscCard    = nullptr;
+uint32_t   g_mscSectors = 0;
+static SdCardFactory g_mscCardFactory;
+
+// The core installs the MSC interface into the USB descriptor only if this weak
+// "presence" function is defined (it does `install_MSD = __USBInstallMSD`). Must be
+// C++ linkage — NO extern "C" (the core declares it that way; extern "C" = conflict).
+void __USBInstallMSD() { /* noop: presence enables MSC */ }
+
+// Init the SD as a raw block device (no filesystem mount) for MSC. Returns false if
+// the card can't be read (then MSC reports "no media" and the logger stays off).
+static bool enterMscMode() {
+    g_mscCard = g_mscCardFactory.newCard(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(25)));
+    if (!g_mscCard) return false;
+    g_mscSectors = g_mscCard->sectorCount();
+    if (g_mscSectors == 0) return false;
+    g_mscMode = true;
+    return true;
+}
+
+// ---- TinyUSB MSC device callbacks (USB device task runs in the core's ThreadX thread) ----
+extern "C" {
+void tud_msc_inquiry_cb(uint8_t lun, uint8_t vid[8], uint8_t pid[16], uint8_t rev[4]) {
+    (void)lun;
+    memcpy(vid, "SSSAL   ",          8);
+    memcpy(pid, "SD Card Logger  ", 16);
+    memcpy(rev, "1.0 ",              4);
+}
+bool tud_msc_test_unit_ready_cb(uint8_t lun) {
+    (void)lun;
+    return g_mscMode && g_mscCard && g_mscSectors > 0;   // false unless MSC mode → no mid-logging corruption
+}
+void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_size) {
+    (void)lun; *block_count = g_mscSectors; *block_size = 512;
+}
+bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) {
+    (void)lun; (void)power_condition; (void)start; (void)load_eject; return true;
+}
+int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
+    (void)lun; (void)offset;
+    if (!g_mscMode || !g_mscCard) return -1;
+    uint32_t ns = bufsize / 512; if (ns == 0) return -1;
+    if (!g_mscCard->readSectors(lba, (uint8_t*)buffer, ns)) return -1;
+    return (int32_t)(ns * 512);
+}
+int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+    (void)lun; (void)offset;
+    if (!g_mscMode || !g_mscCard) return -1;
+    uint32_t ns = bufsize / 512; if (ns == 0) return -1;
+    if (!g_mscCard->writeSectors(lba, buffer, ns)) return -1;
+    return (int32_t)(ns * 512);
+}
+int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void* buffer, uint16_t bufsize) {
+    (void)lun; (void)scsi_cmd; (void)buffer; (void)bufsize; return -1;   // no vendor SCSI
+}
+} // extern "C"
+
 void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
     Serial.begin(SERIAL_DEBUG_BAUD);
     Serial1.begin(SSM_BAUD, SERIAL_8N1);
+
+    // ---- Wake the K-line transceiver (LINTTL3 SLP pin: HIGH = normal/awake) ----
+    pinMode(SLP_PIN, OUTPUT);
+    digitalWrite(SLP_PIN, HIGH);
+
+    // ---- USB-MSC mode latch ----
+    // If a USB host enumerates us within ~1.5s of boot we're on a PC → serve the SD
+    // as a USB drive and skip the logger. In the car (no USB host) this falls through.
+    {
+        uint32_t t0 = millis();
+        while (!tud_mounted() && (millis() - t0) < 1500) { delay(10); }
+        if (tud_mounted()) {
+            if (enterMscMode())
+                Serial.println(F("[BOOT] USB host detected -> USB Mass Storage mode (SD as drive)"));
+            else
+                Serial.println(F("[BOOT] USB host detected but SD block init FAILED"));
+            digitalWrite(LED_BUILTIN, HIGH);   // solid = MSC mode
+            return;                             // skip logger init; USB thread serves the drive
+        }
+    }
 
     // ---- SD init ----
     if (!g_sd.begin(SD_CS_PIN, SD_SCK_MHZ(25))) {
@@ -2468,6 +2572,36 @@ void setup() {
     // ---- RTC ----
     g_rtcOk = g_rtc.begin();
     vlog(g_rtcOk ? "[BOOT] RTC OK" : "[BOOT] RTC not responding");
+
+    // ---- RTC set ----
+    // Priority 1: /logger/settime.txt ("YYYY-MM-DD HH:MM:SS", one-shot — deleted after use).
+    //   Drop this file on the card (e.g. over USB-MSC) then boot once to set the clock exactly.
+    // Priority 2: if the RTC oscillator isn't running (fresh board reads 2000-01-01), set it to
+    //   this firmware's compile time so logs at least carry a sane recent date.
+    if (g_rtcOk) {
+        bool rtcSet = false;
+        SdFile tf;
+        if (tf.open("/logger/settime.txt", O_READ)) {
+            char buf[24] = {0};
+            int n = tf.read(buf, sizeof(buf) - 1);
+            tf.close();
+            int Y, Mo, D, H, Mi, S;
+            if (n > 0 && sscanf(buf, "%d-%d-%d %d:%d:%d", &Y, &Mo, &D, &H, &Mi, &S) == 6) {
+                g_rtc.adjust(DateTime((uint16_t)Y, (uint8_t)Mo, (uint8_t)D, (uint8_t)H, (uint8_t)Mi, (uint8_t)S));
+                rtcSet = true;
+            }
+            g_sd.remove("/logger/settime.txt");   // one-shot, whether or not it parsed
+            if (rtcSet) writeStatusLog("RTC_SET", "from settime.txt");
+        }
+        if (!rtcSet && !g_rtc.isrunning()) {
+            g_rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+            writeStatusLog("RTC_SET", "compile time (RTC was unset)");
+        }
+    }
+
+    // ---- Wire the RTC into SdFat so FAT directory timestamps (file created/modified
+    //      dates in Explorer) match the clock, not SdFat's default epoch. ----
+    FsDateTime::setCallback(sdDateTimeCallback);
 
     // ---- Find definitions file ----
     if (!findDefsFile()) {
@@ -2581,6 +2715,10 @@ static void writeFirstPacketStatus() {
 }
 
 void loop() {
+
+    // USB Mass Storage mode: the core's USB thread serves the SD as a drive;
+    // the logger does not run. (Latched at boot in setup().)
+    if (g_mscMode) { delay(50); return; }
 
     // ================================================================
     // PHASE_SEARCH — fast retry loop (up to PHASE1_SEARCH_DURATION_MS)
