@@ -27,6 +27,9 @@ extern "C" {
 //   Status LED      : LED_BUILTIN (D13).
 //   Power           : OBD-II pin 16 (+12V) / pins 4,5 (GND) via a 12V->5V supply.
 //
+// -- Firmware version --
+#define SSSAL_VERSION        "alpha7.0"   // emitted in the log provenance remark
+
 // -- Hardware pins --
 #define SD_CS_PIN            10     // logger shield SD chip select (SPI)
 #define SLP_PIN              2      // LINTTL3 (TJA1021) transceiver sleep control — HIGH = awake
@@ -83,6 +86,7 @@ extern "C" {
 #define UNKNOWNECU_FILE      "/logger/unknownecu.xml"
 #define ADDR_MAP_FILE        "/logger/address_map.csv"
 #define STATUS_LOG_FILE      "/logger/status.log"
+#define STATUS_LOG_OLD       "/logger/status.1.log"  // previous generation kept on rotate
 #define COUNTER_FILE         "/logger/counter.txt"
 #define VERBOSE_LOG_FILE     "/logger/verboselog.txt"  // created when DEBUG=true in address_map.csv
 
@@ -184,6 +188,10 @@ uint32_t g_lastSync     = 0;
 uint8_t  g_protocol    = PROTO_SSM;
 uint8_t  g_phase       = PHASE_SEARCH;
 uint16_t g_sessionNum  = 0;
+// Count of Software-Standby wakes since boot. Logged in the IDLE_WAKE status line so a
+// log can tell "woke from standby, probed, found nothing" apart from "never woke at all"
+// (those two are otherwise indistinguishable from the card — see wakeReinitKline()).
+uint16_t g_idleWakeCount = 0;
 
 // ROM ID of currently connected ECU (10 hex chars + NUL)
 char     g_romId[11]   = {0};
@@ -219,6 +227,11 @@ bool     g_firstPacket = false;
 bool     g_sdWriteError = false;
 // Filename of the current open log file (set when file opened, used for status.log)
 char     g_logFilename[28] = {0};
+// Per-log time baseline: millis() latched at the first row, subtracted from every row so
+// each log's time column starts at 0 (matches RomRaider's relative Time (msec)). Reset per
+// log open; row-to-row deltas are unchanged, only the absolute offset is removed.
+uint32_t g_logStartMillis = 0;
+bool     g_logStartSet    = false;
 // Verbose debug logging: set from the DEBUG= line at the top of address_map.csv.
 // When true, vlog() appends a timestamped line to verboselog.txt at each call site.
 bool     g_verboseDebug = false;
@@ -2030,8 +2043,12 @@ void rotateStatusLog() {
     uint32_t sz = f.fileSize();
     f.close();
     if (sz > STATUS_LOG_MAX_BYTES) {
-        g_sd.remove(STATUS_LOG_FILE);
-        Serial.println(F("[SD] status.log rotated"));
+        // Keep one previous generation instead of deleting outright: the LOG_CLOSED /
+        // IDLE_WAKE history is the whole point of this file and must survive a reboot.
+        g_sd.remove(STATUS_LOG_OLD);                        // drop the older generation
+        if (!g_sd.rename(STATUS_LOG_FILE, STATUS_LOG_OLD))  // status.log -> status.1.log
+            g_sd.remove(STATUS_LOG_FILE);                   // fallback: cap growth if rename fails
+        Serial.println(F("[SD] status.log rotated -> status.1.log"));
     }
 }
 
@@ -2082,16 +2099,39 @@ bool regenCache() {
 
 // ---- Log file ops ----
 
-// Write CSV header row: "millis,Name1 (ID1),Name2 (ID2),..."
+// Write CSV header row: "Time (msec),Name1 (units1) [ID1],Name2 (units2) [ID2],..."
+// "Time (msec)" matches RomRaider's relative-timestamp column header; values are ms from 0.
+// The "Name (units)" prefix mirrors a RomRaider logger CSV header (same def name, same
+// profile units) so the two line up on name+units; the "[ID]" suffix keeps each column
+// self-describing and unambiguous (RomRaider omits the id, and two params can share units
+// e.g. "%", so the id is the only collision-free key). Units omitted if the profile gave none.
 static void writeLogHeader() {
-    writeToBuffer("millis");
+    // Provenance remark (line 1), '#'-prefixed so parsers skip it; header follows on line 2.
+    {
+        DateTime nowRt = queryRTC();
+        char remark[160];
+        snprintf(remark, sizeof(remark),
+                 "# Created by SSSAL %s | ROM %s | %04u-%02u-%02u %02u:%02u:%02u | defs %s\n",
+                 SSSAL_VERSION,
+                 g_romId[0] ? g_romId : "unknown",
+                 nowRt.year(), nowRt.month(), nowRt.day(),
+                 nowRt.hour(), nowRt.minute(), nowRt.second(),
+                 g_defsFilename[0] ? g_defsFilename : "none");
+        writeToBuffer(remark);
+    }
+    writeToBuffer("Time (msec)");
     for (uint8_t i = 0; i < g_numSel; i++) {
         if (g_sel[i].hidden) continue;   // dep-only params not in CSV output
         writeToBuffer(",");
         writeToBuffer(g_sel[i].name);
-        writeToBuffer(" (");
+        if (g_parseUnits[i][0]) {
+            writeToBuffer(" (");
+            writeToBuffer(g_parseUnits[i]);
+            writeToBuffer(")");
+        }
+        writeToBuffer(" [");
         writeToBuffer(g_sel[i].id);
-        writeToBuffer(")");
+        writeToBuffer("]");
     }
     writeToBuffer("\n");
 }
@@ -2132,6 +2172,7 @@ static bool openLogFile(const char *filename) {
     g_writeBufPos  = 0;
     g_sdWriteError = false;
     g_lastSync     = millis();
+    g_logStartSet  = false;   // re-baseline the time column for this new log
     writeLogHeader();
     return true;
 }
@@ -2181,7 +2222,9 @@ static void writeSampledRow(float *vals) {
 
     // Format and buffer CSV row
     char cell[20];
-    snprintf(cell, sizeof(cell), "%lu", (unsigned long)millis());
+    uint32_t nowMs = millis();
+    if (!g_logStartSet) { g_logStartMillis = nowMs; g_logStartSet = true; }  // latch on first row → starts at 0
+    snprintf(cell, sizeof(cell), "%lu", (unsigned long)(nowMs - g_logStartMillis));
     writeToBuffer(cell);
     for (uint8_t i = 0; i < g_numSel; i++) {
         if (g_sel[i].hidden) continue;
@@ -2320,15 +2363,31 @@ static void clearAGT1Flags() {
 }
 
 // Enter Software Standby; wake on AGT1 underflow.
-// NOTE: WUPEN bit 24 for AGT1 underflow — VERIFY against RA4M1 manual on hw arrival.
+// WUPEN bit 24 = AGT1UDWUPEN ("AGT1 Underflow Software Standby/Snooze Returns Enable"),
+// confirmed a real WUPEN0 field in the RA4M1 register set. Empirically self-checked on-car
+// by the IDLE_WAKE status line: if bit 24 is correct, every standby exit emits one.
 static void softwareStandbySleep() {
-    R_ICU->WUPEN  |= (1UL << 24);   // enable AGT1 underflow wakeup
+    R_ICU->WUPEN  |= (1UL << 24);   // enable AGT1 underflow wakeup (AGT1UDWUPEN)
     R_SYSTEM->PRCR = 0xA503;        // unlock standby registers (CRITICAL)
     R_SYSTEM->SBYCR_b.SSBY = 1;     // select Software Standby mode
     R_DTC->DTCST_b.DTCST = 0;       // disable DTC
     R_SYSTEM->OSTDCR_b.OSTDE = 0;   // disable oscillation stop detection
     asm volatile("wfi");             // sleep until interrupt
     R_SYSTEM->PRCR = 0xA500;        // re-lock standby registers
+}
+
+// Re-establish the K-line interface after a Software Standby wake.
+// Software Standby stops the SCI (Serial1) clock, and the sketch only ever called
+// Serial1.begin()/SLP_PIN setup once, in setup(). Probing straight out of standby
+// therefore read/wrote into a stalled UART, so the ECU was never detected after the
+// first idle cycle — the permanent-stop bug when OBD power is continuous (nothing ever
+// power-cycles the board to re-run setup). Re-init the UART + transceiver before probing.
+static void wakeReinitKline() {
+    Serial1.begin(SSM_BAUD, SERIAL_8N1);
+    pinMode(SLP_PIN, OUTPUT);
+    digitalWrite(SLP_PIN, HIGH);        // LINTTL3 transceiver awake
+    delay(5);                           // transceiver wake settle
+    if (g_protocol == PROTO_SSM) ssmFlushRx();
 }
 
 // ---- Fatal error halt ----
@@ -2766,6 +2825,15 @@ void loop() {
         setupAGT1Wakeup((uint16_t)counts);
         softwareStandbySleep();
         clearAGT1Flags();
+
+        // Re-init the UART + transceiver that Software Standby stalled, BEFORE probing.
+        wakeReinitKline();
+
+        // Mark the wake so the next log distinguishes "woke, probed, found nothing"
+        // from "never woke". If this line never appears, the AGT1 wake itself failed.
+        char wd[24];
+        snprintf(wd, sizeof(wd), "count=%u", (unsigned)(++g_idleWakeCount));
+        writeStatusLog("IDLE_WAKE", wd);
 
         if (protocolProbe()) {
             // Pre-set PHASE_SEARCH before handleEcuFound(): if the file open fails

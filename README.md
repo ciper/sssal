@@ -1,6 +1,6 @@
 Stand alone high speed K-Line logging to an sdcard using an arduino. Canbus support is a work in progress. Although no Romraider Logger code was used directly it was an essential guide to get "fast polling" of ecu data. That project can be found at https://github.com/RomRaider/RomRaider
 
-## Firmware — Alpha v5
+## Firmware — alpha7.0
 
 Standalone SSM (K-Line) data logger for the **Arduino Uno R4 Minima**. Reads RomRaider
 `logger.xml` profiles + `logger_*.xml` definitions from the SD card, builds a complete
@@ -8,7 +8,7 @@ per-ECU parameter dictionary, and logs to CSV via SSM fast-poll (continuous) bat
 Auto-generates a profile when the ECU is unknown or no `logger.xml` is present.
 
 - **Source:** `firmware/sssal/sssal.ino`
-- **Compiled binary:** `firmware/binaries/sssal_alpha5.bin` / `.hex`
+- **Compiled binary:** `firmware/binaries/sssal_alpha7.bin` / `.hex`
 - **Build:** `arduino-cli compile --fqbn arduino:renesas_uno:minima` (libs: SdFat 2.3.0, RTClib 2.1.4, Arduino_CAN). **USB-MSC requires two one-line core patches — see [`firmware/BUILD_NOTES.md`](firmware/BUILD_NOTES.md).**
 - **Flash:** `arduino-cli upload -p <COMx> --fqbn arduino:renesas_uno:minima` (Renesas RA4M1, DFU).
 
@@ -30,6 +30,18 @@ in the full-speed MSC endpoint descriptor).
   (`YYYY-MM-DD HH:MM:SS`) with a compile-time fallback when the RTC is unset; FAT directory
   timestamps now track the RTC (SdFat date/time callback) so file-property dates match the
   filename; K-line transceiver sleep pin (D2) driven awake at boot.
+- **alpha6:** standby-recovery fix. After an engine-off stream-watchdog the logger re-enters
+  Phase 1; the low-power idle path (Software Standby) previously never recovered when the OBD
+  port stays powered (nothing power-cycles the board). Now re-inits the UART + transceiver on
+  every wake before probing, and emits an `IDLE_WAKE count=N` status line so a log can tell
+  "woke, found nothing" from "never woke". `status.log` rotates to `status.1.log` at 2 KB
+  instead of being deleted, so the close/wake history survives a reboot. *(Flashed; on-car
+  verification of the standby path pending.)*
+- **alpha7.0:** RomRaider-aligned log format. Each log opens with a `#`-prefixed provenance
+  remark (`# Created by SSSAL <ver> | ROM <id> | <datetime> | defs <file>`); the time column is
+  now `Time (msec)` and is **zeroed per log** (first row = 0) to match RomRaider's relative
+  timestamp; value-column headers are `Name (units) [ID]`. Data values keep full SSSAL
+  resolution (uniform 2 decimals — not rounded to RomRaider's per-column `format`).
 
 ### Pre-flight tool (`tools/SsmInitTiming.cs`)
 A PC-side J2534 validator (Tactrix OpenPort 2.0) that checks everything the firmware relies
