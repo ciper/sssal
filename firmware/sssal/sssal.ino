@@ -27,8 +27,63 @@ extern "C" {
 //   Status LED      : LED_BUILTIN (D13).
 //   Power           : OBD-II pin 16 (+12V) / pins 4,5 (GND) via a 12V->5V supply.
 //
+// -- FAST STANDBY TEST BUILD --
+// 1 = shrink the Phase-1 search AND the standby sleep to 5 s each, so the sleep/wake LED
+// blinks can be watched in seconds instead of minutes. TEST ONLY — set back to 0 to restore
+// the real logging timing (2-min search / 2-min sleep) before any on-car use.
+#define STANDBY_FAST_TEST    0
+
+// -- LOW-POWER STANDBY ENABLE --
+// 0 = NEVER enter PHASE_IDLE/Software Standby; stay in fast-search indefinitely (~7.5 mA parked).
+// 1 = use PHASE_IDLE/Software Standby (~40 uA parked).
+// ★ ENABLED 2026-10-12: the standby wake is now PROVEN ON HARDWARE. One-shot bench test
+// (alpha7.9-sleep1c) logged `stage=5 WOKE rtc_s=10 millis_s=0 hits=1` — exactly 10 s of real
+// DS1307 time with the MCU clock NOT advancing, i.e. genuine Software Standby followed by an
+// AGT1-underflow wake, then 2+ min of stable ALIVE heartbeats. Both root causes fixed:
+//   (1) wrong AGTMR1/AGTMR2 register offsets (0x18/0x19 -> 0x09/0x0A), and
+//   (2) AGTMR2.LPM set while the timer was STOPPED, which prevents it ever starting.
+// ⚠ STILL TO VERIFY ON-CAR: a real key-off must produce `IDLE_WAKE` lines in status.log. If a
+// drive is ever lost again, fall straight back to 0 (that build captured 46 logs with zero loss).
+#define STANDBY_ENABLED      1
+
+// -- SLEEP-CYCLE BENCH TEST --
+// 1 = standalone sleep/wake harness. Ignores the ECU AND the USB-MSC boot latch, then cycles
+// AWAKE (LED solid ON) → Software Standby (LED OFF) forever, logging every transition to
+// status.log. Purpose: prove the standby wake works, off-car, in under a minute.
+// ⚠ TEST ONLY — set to 0 for any real build. While this runs the card is NOT served as a USB
+// drive, so to read status.log either flash a 0-build or read the microSD in an adapter.
+#define SLEEP_CYCLE_TEST     0
+#define SLEEP_TEST_AWAKE_MS  30000   // awake window, LED solid ON
+#define SLEEP_TEST_SLEEP_MS  10000   // Software Standby window, LED OFF
+
+// -- ONE-SHOT SLEEP TEST --
+// 1 = sleep exactly ONCE, wake, then stay awake forever emitting heartbeats. Heavy logging at
+// every stage so the exact point of failure is visible in status.log.
+// ⚠ CRITICAL: LED_BUILTIN == pin 13 == PIN_SPI_SCK. Driving the LED reconfigures the SD card's
+// SPI clock as GPIO and SILENTLY KILLS all SD writes. This test therefore touches NO LED before
+// its logging, and calls g_sd.begin() to restore SPI after the wake indicator fires.
+// ⚠ GOTCHA FIXED 2026-10-12: sleepOnceTest() used to run BEFORE loop()'s g_mscMode check, so a
+// board plugged into a PC booted → MSC → slept ~1 s later → Software Standby kills the USB
+// peripheral → the drive vanished mid-enumeration (observed: Windows "disk 51 error on
+// \Device\Harddisk2" then no device at all) and the result was UNREADABLE without pulling the
+// microSD. Standby does not restore USB on wake either, so USB presence is NOT a wake indicator.
+// Now gated on !g_mscMode: host power ⇒ serve the card as a drive (test skipped, result readable);
+// charger/car power ⇒ no host, latch expires, test runs. Read the result on the next host connect.
+#define SLEEP_ONCE_TEST      0
+#define SLEEP_ONCE_MS        10000   // single Software Standby duration
+
 // -- Firmware version --
-#define SSSAL_VERSION        "alpha7.0"   // emitted in the log provenance remark
+#if SLEEP_ONCE_TEST
+#define SSSAL_VERSION        "alpha7.9-sleep1c"   // one-shot sleep/wake test + AGT probe matrix
+#elif SLEEP_CYCLE_TEST
+#define SSSAL_VERSION        "alpha7.9-sleeptest" // standalone sleep/wake bench harness
+#elif STANDBY_FAST_TEST
+#define SSSAL_VERSION        "alpha7.9-test"     // fast 5 s sleep/wake + AGT diagnostic
+#elif !STANDBY_ENABLED
+#define SSSAL_VERSION        "alpha7.9-nosleep"  // logging build; standby path disabled
+#else
+#define SSSAL_VERSION        "alpha8.0"          // emitted in the log provenance remark
+#endif
 
 // -- Hardware pins --
 #define SD_CS_PIN            10     // logger shield SD chip select (SPI)
@@ -48,8 +103,13 @@ extern "C" {
 //   init  first-byte = PHASE1_RETRY_MS (300ms)   init  inter-byte = 100ms (~line 277)
 //   batch first-byte = PHASE2_WATCHDOG_MS (5s)    batch inter-byte = 200ms (~line 380)
 #define PHASE1_RETRY_MS            300    // init response first-byte timeout (floor ~18ms; big buffer)
+#if STANDBY_FAST_TEST
+#define PHASE1_SEARCH_DURATION_MS  5000   // TEST: 5 s of retries before sleeping
+#define PHASE1_IDLE_SLEEP_MS       5000   // TEST: 5 s standby sleep per cycle
+#else
 #define PHASE1_SEARCH_DURATION_MS  120000 // 2 min of fast retries before sleeping (PHASE1_SEARCH)
 #define PHASE1_IDLE_SLEEP_MS       120000 // 2 min sleep between retries when parked (PHASE1_IDLE)
+#endif
 #define PHASE2_WATCHDOG_MS         5000   // no streaming data → close log, re-enter SEARCH (floor ~181ms; big buffer)
 
 // -- SD write performance --
@@ -58,7 +118,14 @@ extern "C" {
 #define SYNC_INTERVAL_MS     1000   // file.sync() every 1s; ~1-2ms at 25MHz SPI
 
 // -- status.log --
-#define STATUS_LOG_MAX_BYTES 2048   // rotate (delete) status.log when it exceeds this size
+#if SLEEP_CYCLE_TEST || SLEEP_ONCE_TEST
+#define STATUS_LOG_MAX_BYTES 32768  // TEST: keep many sleep/wake cycles of history
+#else
+// 32 KB (was 2048) from alpha8.0: status.log is the ONLY evidence that the newly-enabled standby
+// path recovers on-car, and each parked wake adds an IDLE_WAKE line. 2 KB rotated away roughly
+// an hour of parking. Rotation only runs at boot, so this just preserves more history per card.
+#define STATUS_LOG_MAX_BYTES 32768  // rotate status.log -> status.1.log above this size
+#endif
 
 // -- Session counter --
 #define COUNTER_MAX          9999   // wrap to 1 after reaching this value
@@ -2329,50 +2396,259 @@ static void buildFilename(char *out, uint8_t maxLen) {
 
 #define AGT1_BASE    0x40084100UL
 #define AGT1_AGT     ((volatile uint16_t*)(AGT1_BASE + 0x00))
+// ★★★ OFFSETS CORRECTED 2026-10-12 — verified against svd/R7FA4M1AB.svd (AGT1 block).
+// The previous map was WRONG and was THE root cause of "sleeps but never wakes":
+//   AGTMR1 was 0x18 (actual 0x09) · AGTMR2 was 0x19 (actual 0x0A)
+//   "AGTIOC" 0x09 was really AGTMR1 · "AGTISR" 0x0A was really AGTMR2 · "AGTCMSR" 0x0B -> 0x0E
+// Effect: the clear-to-zero step zeroed the REAL mode registers, and the intended
+// TCK=AGTLCLK / LPM=1 writes went to 0x18/0x19 (outside the AGT block) and vanished. AGTMR1
+// therefore stayed 0x00 => TCK=000 => count source PCLKB, which STOPS in Software Standby, so
+// the timer froze on sleep and could never underflow to cancel standby.
+// MEASURED PROOF (alpha7.9-sleep1, 2026-10-11 22:48): "MR1=0x00 MR2=0x00 AGTCR=0x03".
 #define AGT1_AGTCR   ((volatile uint8_t*) (AGT1_BASE + 0x08))
-#define AGT1_AGTIOC  ((volatile uint8_t*) (AGT1_BASE + 0x09))
-#define AGT1_AGTISR  ((volatile uint8_t*) (AGT1_BASE + 0x0A))
-#define AGT1_AGTCMSR ((volatile uint8_t*) (AGT1_BASE + 0x0B))
+#define AGT1_AGTMR1  ((volatile uint8_t*) (AGT1_BASE + 0x09))
+#define AGT1_AGTMR2  ((volatile uint8_t*) (AGT1_BASE + 0x0A))
+#define AGT1_AGTIOC  ((volatile uint8_t*) (AGT1_BASE + 0x0C))
+#define AGT1_AGTISR  ((volatile uint8_t*) (AGT1_BASE + 0x0D))
+#define AGT1_AGTCMSR ((volatile uint8_t*) (AGT1_BASE + 0x0E))
 #define AGT1_AGTIOSEL ((volatile uint8_t*)(AGT1_BASE + 0x0F))
-#define AGT1_AGTMR1  ((volatile uint8_t*) (AGT1_BASE + 0x18))
-#define AGT1_AGTMR2  ((volatile uint8_t*) (AGT1_BASE + 0x19))
-#define MSTP_MSTPCRD ((volatile uint32_t*)0x4001E01CUL)
+// MSTPCRD lives in R_MSTP (base 0x40047000) at offset 0x08. MSTPD2 = AGT1, MSTPD3 = AGT0.
+// ⚠ This was previously 0x4001E01C, which is MSTPCRA in R_SYSTEM — a DIFFERENT register — so
+// AGT1 was never released from module-stop: every AGT1 register ignored writes and read back 0
+// (AGTCR stayed 0x00, counter stayed 0), the timer never ran, and it could therefore never
+// underflow to cancel Software Standby. THE root cause of "sleeps but never wakes".
+#define MSTP_MSTPCRD ((volatile uint32_t*)0x40047008UL)
+
+// ---- AGT1 underflow INTERRUPT (required for the Software Standby wake) ----
+// Renesas low-power app note (R11AN0471, "exit Software Standby with AGT1 underflow"):
+// "To wake from standby through AGT1 underflow, that interrupt must be enabled."
+// WUPEN bit 28 only PERMITS the standby cancel — it does not create the event. Without an ICU
+// event link (IELSR) + NVIC enable there is no interrupt for WUPEN to permit, which is why the
+// timer could underflow repeatedly while awake and still never cancel standby.
+// IRQManager::addGenericInterrupt() does all three: claims an IELSR slot, patches the RAM
+// vector table (SCB->VTOR), and sets NVIC priority + enable.
+static IRQn_Type         g_agt1Irqn    = FSP_INVALID_VECTOR;
+static volatile uint32_t g_agt1IsrHits = 0;   // proves the underflow IRQ actually fires
+
+static void agt1UnderflowIsr(void) {
+    uint8_t cr = *AGT1_AGTCR;
+    *AGT1_AGTCR = (uint8_t)(cr & (uint8_t)~0x20u);          // clear TUNDF (bit 5)
+    if (g_agt1Irqn != FSP_INVALID_VECTOR) R_BSP_IrqStatusClear(g_agt1Irqn);
+    g_agt1IsrHits++;
+}
+
+static void ensureAgt1Irq() {
+    if (g_agt1Irqn != FSP_INVALID_VECTOR) return;           // register once
+    GenericIrqCfg_t cfg;
+    cfg.irq   = FSP_INVALID_VECTOR;                          // let IRQManager assign a slot
+    cfg.ipl   = 12;                                          // low priority; it only must exist
+    cfg.event = ELC_EVENT_AGT1_INT;                          // RA4M1 ELC event 33
+    if (IRQManager::getInstance().addGenericInterrupt(cfg, agt1UnderflowIsr))
+        g_agt1Irqn = cfg.irq;
+}
 
 // Configure AGT1 to fire after `counts` AGTLCLK/128 ticks.
 // AGTLCLK = 32.768 kHz / 128 = 256 Hz → 2 min = 30720 counts.
 // Module clock MUST be enabled first — accessing registers with MSTPD2 set is undefined.
 static void setupAGT1Wakeup(uint16_t counts) {
-    *MSTP_MSTPCRD &= ~(1UL << 2);   // enable AGT1 module clock (MSTPD2) — MUST be first
-    *AGT1_AGTCR    = 0;             // stop timer, clear flags
+    // The AGTLCLK count source (selected below) is derived from LOCO. The Arduino core does
+    // NOT start LOCO unless the internal RTC is used — and we use an external DS1307 — so LOCO
+    // is left stopped, leaving the AGT with no clock during Software Standby: it never counts,
+    // never underflows, never wakes. (This, together with the WUPEN-bit and SLEEPDEEP fixes,
+    // was why standby never woke.) Explicitly start LOCO; it keeps running in Software Standby,
+    // which is exactly what lets the AGT underflow cancel it.
+    R_SYSTEM->PRCR = 0xA503;             // unlock clock-control (PRC0) + LPM (PRC1) registers
+    R_SYSTEM->LOCOCR_b.LCSTP = 0;        // 0 = LOCO operating
+    R_SYSTEM->PRCR = 0xA500;             // re-lock
+    delayMicroseconds(150);              // LOCO stabilization (~100 us max per BSP feature)
+
+    ensureAgt1Irq();                // the underflow IRQ must exist for WUPEN to cancel standby
+
+    // ★ INIT ORDER IS LOAD-BEARING. Empirically proven on this exact board (Arduino forum
+    // "Problem with UNO R4 AGT timer with LOCO source" — the thread this register code was
+    // originally adapted from): the AGT registers must be CLEARED **BEFORE** clearing MSTPD2,
+    // not after. Getting it backwards makes the later config writes have NO EFFECT — reported
+    // there as "the count value had no effect on the rate" / timer ~55000x off, and measured
+    // here as CKS(/128) and LPM never latching (~4.5 kHz instead of 256 Hz, MR2 LPM stuck 0).
+    // Order: clear all AGT regs → cancel module-stop → count → AGTMR1 → AGTMR2 → TSTART.
+    *AGT1_AGTCR    = 0;
     *AGT1_AGTMR1   = 0;
     *AGT1_AGTMR2   = 0;
     *AGT1_AGTIOC   = 0;
     *AGT1_AGTISR   = 0;
     *AGT1_AGTCMSR  = 0;
     *AGT1_AGTIOSEL = 0;
-    *AGT1_AGT      = counts;
-    *AGT1_AGTMR1   = (4 << 4);      // AGTLCLK source (value 4 = AGTSRC_AGTLCLK)
-    *AGT1_AGTMR2   = 7;             // /128 prescaler
-    *AGT1_AGTCR    = 1;             // TSTART — begin countdown
+
+    R_SYSTEM->PRCR = 0xA503;        // unlock — module-stop registers are PRC1-protected
+    *MSTP_MSTPCRD &= ~(1UL << 2);   // MSTPD2 = 0 → cancel AGT1 module-stop (R_MSTP+0x08)
+    R_SYSTEM->PRCR = 0xA500;        // re-lock
+
+    // ★★ SEQUENCE CORRECTED 2026-10-12 (measured: with MR1=0x40/MR2=0x87 written BEFORE start,
+    // the counter did not move at all — `AGT 2560->2560 d=0` with TCSTF=0, i.e. the timer never
+    // entered the counting state). Renesas FSP `r_agt.c` does it differently and we now match it:
+    //   · FSP NEVER sets AGTMR2.LPM — it writes ONLY the CKS divider (`agtmr2 = p_cfg->source_div`).
+    //   · FSP starts with AGTCR = 0xF1 (`AGT_PRV_AGTCR_START_TIMER`), not 0x01. The upper nibble
+    //     are the TCMBF/TCMAF/TUNDF/TEDGF status flags, which are write-0-to-clear, so writing 1
+    //     PRESERVES them; writing 0x01 silently clears all four as a side effect.
+    //   · FSP then waits for TCSTF==1 "before modifying any other AGT registers. See Count
+    //     Operation Start and Stop Control in the AGT Usage Notes" — so LPM must be set AFTER the
+    //     timer is confirmed running, not before.
+    // Hypothesis under test: setting LPM=1 while stopped prevents the count from ever starting.
+    *AGT1_AGT      = counts;        // count value
+    *AGT1_AGTMR1   = (4 << 4);      // TCK=0b100 → AGTLCLK (LOCO-derived); AGT_CLOCK_LOCO == 0x40
+    *AGT1_AGTMR2   = 7;             // CKS=111 = /128 → 256 Hz. LPM deliberately 0 here.
+    *AGT1_AGTCR    = 0xF1;          // TSTART, preserving status flags (FSP start value)
+
+    // Wait for the count to actually be running before touching anything else.
+    { uint32_t t0 = millis(); while (!(*AGT1_AGTCR & 0x02u) && (millis() - t0) < 100) { } }
+
+    // Now that TCSTF is set, enable Low Power mode so the counter keeps running once the main
+    // clocks stop in Software Standby. Read-modify-write: do not disturb CKS.
+    { uint8_t m2 = *AGT1_AGTMR2; *AGT1_AGTMR2 = (uint8_t)(m2 | 0x80u); }
+    delayMicroseconds(200);         // let the first count/reload settle
+    // Drop the start-up underflow. TUNDF is AGTCR **bit 5** (bit 4 is TEDGF). Renesas flag
+    // convention = read, then write 0 to the flag; read-modify-write preserves TSTART so the
+    // timer keeps running. A latched TUNDF means the next underflow produces no fresh
+    // standby-cancel edge, so it must be clear before every sleep.
+    { uint8_t cr = *AGT1_AGTCR; *AGT1_AGTCR = (uint8_t)(cr & (uint8_t)~0x20u); }
+    R_ICU->WUPEN  |= (1UL << 28);   // arm AGT1-underflow standby cancel here too (idempotent),
+                                    // so diagnostics can read back the real WUPEN state
 }
+
+#if SLEEP_ONCE_TEST
+// ── AGT1 COUNT-SOURCE PROBE (diagnostic only; runs AWAKE, never sleeps) ────────────────────────
+// Added 2026-10-12 after the corrected-offset run proved the registers latch (MR1=0x40 MR2=0x87)
+// but the counter was frozen (`AGT 2560->2560 d=0`, TCSTF=0). Rather than guess which knob kills
+// the count, try every candidate config in ONE power cycle and log the measured decrement.
+// `sampleMs` = 0 → read the counter back-to-back (for fast sources like PCLKB that wrap in ms).
+// `setLpmAfterStart` → start with LPM=0, wait for TCSTF, THEN set LPM=1 (the FSP-compliant order).
+// Returns the observed decrement; 0 ⇒ that count source is not clocking the timer.
+static int32_t probeAgt1(const char* tag, uint8_t mr1, uint8_t mr2,
+                         uint16_t sampleMs, bool setLpmAfterStart) {
+    char d[184];
+
+    // Stop, and wait for the stop to take effect (FSP r_agt_common_preamble: TSTART must == TCSTF).
+    *AGT1_AGTCR = 0;
+    uint32_t t0 = millis();
+    while ((*AGT1_AGTCR & 0x02u) && (millis() - t0) < 50) { }
+    unsigned stopped = ((*AGT1_AGTCR & 0x02u) == 0) ? 1u : 0u;
+
+    *AGT1_AGT    = 0xFFFF;          // full-scale reload so a slow source still shows a decrement
+    *AGT1_AGTMR1 = mr1;
+    *AGT1_AGTMR2 = mr2;
+    *AGT1_AGTCR  = 0xF1;            // start, preserving status flags
+
+    t0 = millis();
+    while (!(*AGT1_AGTCR & 0x02u) && (millis() - t0) < 200) { }
+    unsigned long tcstfMs = (unsigned long)(millis() - t0);
+    unsigned running = ((*AGT1_AGTCR & 0x02u) != 0) ? 1u : 0u;
+
+    if (setLpmAfterStart) { uint8_t m2 = *AGT1_AGTMR2; *AGT1_AGTMR2 = (uint8_t)(m2 | 0x80u); }
+
+    uint16_t a1 = *AGT1_AGT;
+    if (sampleMs) delay(sampleMs);
+    uint16_t a2 = *AGT1_AGT;
+    int32_t  dec = (int32_t)a1 - (int32_t)a2;
+
+    snprintf(d, sizeof(d),
+             "probe %-14s mr1=0x%02X mr2=0x%02X rb=0x%02X/0x%02X stop=%u tcstf=%u@%lu %u->%u dec=%ld",
+             tag, (unsigned)mr1, (unsigned)mr2,
+             (unsigned)*AGT1_AGTMR1, (unsigned)*AGT1_AGTMR2,
+             stopped, running, tcstfMs, (unsigned)a1, (unsigned)a2, (long)dec);
+    writeStatusLog("SLEEP1", d);
+
+    *AGT1_AGTCR = 0;                // leave stopped for the next probe
+    return dec;
+}
+
+// Run the full probe matrix. Logs one line per config so the failing knob is unambiguous.
+// Expected if LOCO is alive at 32.768 kHz:  /128 → ~51 dec per 200 ms;  /1 → ~6554 per 200 ms.
+static void probeAgt1Matrix() {
+    char d[184];
+
+    // Prep exactly as setupAGT1Wakeup does: start LOCO, clear the AGT block, cancel module-stop.
+    // (Order matters: clear registers BEFORE cancelling MSTPD2 — see setupAGT1Wakeup.)
+    R_SYSTEM->PRCR = 0xA503;
+    R_SYSTEM->LOCOCR_b.LCSTP = 0;        // 0 = LOCO operating
+    R_SYSTEM->PRCR = 0xA500;
+    delayMicroseconds(500);              // generous LOCO stabilization (spec ~100 us)
+
+    *AGT1_AGTCR = 0; *AGT1_AGTMR1 = 0; *AGT1_AGTMR2 = 0; *AGT1_AGTIOC = 0;
+    *AGT1_AGTISR = 0; *AGT1_AGTCMSR = 0; *AGT1_AGTIOSEL = 0;
+
+    R_SYSTEM->PRCR = 0xA503;
+    *MSTP_MSTPCRD &= ~(1UL << 2);        // MSTPD2 = 0 → AGT1 clocked
+    R_SYSTEM->PRCR = 0xA500;
+
+    snprintf(d, sizeof(d), "probe prep LCSTP=%u MSTPCRD=0x%08lX SOSTP=%u",
+             (unsigned)R_SYSTEM->LOCOCR_b.LCSTP, (unsigned long)*MSTP_MSTPCRD,
+             (unsigned)R_SYSTEM->SOSCCR_b.SOSTP);
+    writeStatusLog("SLEEP1", d);
+
+    writeStatusLog("SLEEP1", "probe matrix start (awake; LOCO expect /128~51 /1~6554 per 200ms)");
+
+    // Sanity: PCLKB must tick. Proves module-stop is cancelled, the start sequence works, and the
+    // counter is readable. If THIS reads dec=0 the problem is not the clock source at all.
+    probeAgt1("pclkb",          0x00,        0x00, 0,   false);
+
+    // The failing config from the 2026-10-12 run: LPM set BEFORE start.
+    probeAgt1("loco128-lpm1",   (4 << 4),    0x87, 200, false);
+
+    // Same source, LPM left 0 — exactly what FSP writes.
+    probeAgt1("loco128-lpm0",   (4 << 4),    0x07, 200, false);
+
+    // Undivided LOCO, to separate "source dead" from "divider wrong".
+    probeAgt1("loco1-lpm0",     (4 << 4),    0x00, 200, false);
+
+    // ★ The candidate fix: start with LPM=0, confirm TCSTF, then set LPM=1.
+    probeAgt1("loco128-lpmAfter",(4 << 4),   0x07, 200, true);
+
+    // Negative control: the Minima core stops the sub-clock (SOSCCR.SOSTP=1), so AGTSCLK should
+    // read dec=0. If this one DOES tick, the sub-clock is running and is a better wake source.
+    probeAgt1("subclk128",      (6 << 4),    0x07, 200, false);
+
+    writeStatusLog("SLEEP1", "probe matrix done");
+}
+#endif
 
 // Clear AGT1 underflow flag after wakeup.
 // TUNDF (bit 4 of AGTCR) is write-1-to-clear — must write 1, not 0.
 static void clearAGT1Flags() {
-    *AGT1_AGTCR = (uint8_t)0x10;   // W1C: write 1 to bit 4 (TUNDF) to clear it
+    // TUNDF = AGTCR bit 5 (bit 4 is TEDGF — the old code cleared the wrong flag). Read then
+    // write 0 to the flag; read-modify-write keeps TSTART intact.
+    uint8_t cr = *AGT1_AGTCR;
+    *AGT1_AGTCR = (uint8_t)(cr & (uint8_t)~0x20u);
 }
 
 // Enter Software Standby; wake on AGT1 underflow.
-// WUPEN bit 24 = AGT1UDWUPEN ("AGT1 Underflow Software Standby/Snooze Returns Enable"),
-// confirmed a real WUPEN0 field in the RA4M1 register set. Empirically self-checked on-car
-// by the IDLE_WAKE status line: if bit 24 is correct, every standby exit emits one.
+// WUPEN bit 28 = AGT1UDWUPEN (AGT1 underflow standby-cancel enable). The prior code set
+// bit 24 = RTCALMWUPEN (RTC alarm) — the WRONG source — so the 2-min AGT1 underflow never
+// cancelled Software Standby and the board never woke (confirmed on-car: zero IDLE_WAKE
+// lines after a key-off). Bit map verified against the RA4M1 ICU register definition:
+// 24=RTCALM 25=RTCPRD 27=USBFS 28=AGT1UD 29=AGT1CA 30=AGT1CB 31=IIC0.
 static void softwareStandbySleep() {
-    R_ICU->WUPEN  |= (1UL << 24);   // enable AGT1 underflow wakeup (AGT1UDWUPEN)
+    R_ICU->WUPEN  |= (1UL << 28);   // enable AGT1 underflow wakeup (AGT1UDWUPEN, bit 28)
     R_SYSTEM->PRCR = 0xA503;        // unlock standby registers (CRITICAL)
     R_SYSTEM->SBYCR_b.SSBY = 1;     // select Software Standby mode
     R_DTC->DTCST_b.DTCST = 0;       // disable DTC
     R_SYSTEM->OSTDCR_b.OSTDE = 0;   // disable oscillation stop detection
-    asm volatile("wfi");             // sleep until interrupt
+    // REQUIRED: set the Cortex-M SLEEPDEEP bit so WFI enters Software Standby. Without it,
+    // WFI enters ordinary Sleep mode — the WUPEN wake sources DO NOT apply there and no NVIC
+    // interrupt is armed for AGT1, so the board sleeps at ~8 mA and never wakes. This (not the
+    // WUPEN bit alone) was the real stuck-sleep cause. Mirrors FSP r_lpm.c (set before WFI,
+    // clear on wake).
+    // Clear any latched TUNDF so the upcoming underflow is a FRESH standby-cancel edge.
+    { uint8_t cr = *AGT1_AGTCR; *AGT1_AGTCR = (uint8_t)(cr & (uint8_t)~0x20u); }
+    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+    __DSB();                         // complete prior writes before sleeping
+    asm volatile("wfi");             // enter Software Standby; AGT1 underflow (WUPEN b28) cancels it
+    __ISB();
+    // IMMEDIATE wake proof — a bare GPIO write with NO delay()/SysTick dependency. Exiting
+    // Software Standby restarts the system clock, so anything timing-based (delay(), and hence
+    // blinkLed()) could stall or misbehave right after wake — which would make a SUCCESSFUL
+    // wake look identical to no wake. LED solid ON here means the CPU resumed, full stop.
+    digitalWrite(LED_BUILTIN, HIGH);
+    SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;  // restore plain-sleep default on wake
     R_SYSTEM->PRCR = 0xA500;        // re-lock standby registers
 }
 
@@ -2388,6 +2664,17 @@ static void wakeReinitKline() {
     digitalWrite(SLP_PIN, HIGH);        // LINTTL3 transceiver awake
     delay(5);                           // transceiver wake settle
     if (g_protocol == PROTO_SSM) ssmFlushRx();
+}
+
+// Blink LED_BUILTIN. SD-INDEPENDENT status signal: used to diagnose the Software Standby
+// path by eye, because a failed SD write after standby makes a successful wake look identical
+// to no wake at all in status.log.
+static void blinkLed(uint8_t times, uint16_t onMs) {
+    pinMode(LED_BUILTIN, OUTPUT);
+    for (uint8_t i = 0; i < times; i++) {
+        digitalWrite(LED_BUILTIN, HIGH); delay(onMs);
+        digitalWrite(LED_BUILTIN, LOW);  delay(onMs);
+    }
 }
 
 // ---- Fatal error halt ----
@@ -2595,9 +2882,19 @@ void setup() {
     // ---- USB-MSC mode latch ----
     // If a USB host enumerates us within ~1.5s of boot we're on a PC → serve the SD
     // as a USB drive and skip the logger. In the car (no USB host) this falls through.
+    // NOTE: do NOT bypass this latch for the sleep harness. Tried that (alpha7.9-sleeptest, run
+    // 2026-10-11 22:16): with MSC still advertised but g_mscMode false, the board wrote its 4
+    // setup lines and then nothing at all — the harness never reached its first statement. The
+    // latch stays; run the harness on NON-HOST power (USB charger / power bank / barrel jack)
+    // so this falls through naturally, which is the only configuration proven to write status.log.
     {
         uint32_t t0 = millis();
-        while (!tud_mounted() && (millis() - t0) < 1500) { delay(10); }
+        // 5 s, not 1.5 s: after a DFU flash the host re-enumerates slowly and 1.5 s often timed
+        // out, leaving the board in logger mode while still ADVERTISING a mass-storage device.
+        // Windows then sees a 0-sector/not-ready drive and pops "You need to format the disk" —
+        // aimed at the card holding the only copy of the logs. A longer window makes the drive
+        // mount reliably instead. (Proper fix: don't advertise MSC at all unless serving it.)
+        while (!tud_mounted() && (millis() - t0) < 5000) { delay(10); }
         if (tud_mounted()) {
             if (enterMscMode())
                 Serial.println(F("[BOOT] USB host detected -> USB Mass Storage mode (SD as drive)"));
@@ -2791,7 +3088,157 @@ static void writeFirstPacketStatus() {
     }
 }
 
+#if SLEEP_CYCLE_TEST
+// Standalone sleep/wake bench harness (see SLEEP_CYCLE_TEST). Cycles awake→Software Standby
+// forever, writing every transition to status.log. READING THE RESULT:
+//   • last line is "pre_sleep" and nothing follows  ⇒ entered standby, NEVER woke (bug remains)
+//   • "WOKE" lines appearing every cycle            ⇒ WAKE WORKS
+//   • rtc_s    = real seconds across the sleep (external DS1307 keeps running). Should equal
+//                SLEEP_TEST_SLEEP_MS/1000 (10). If much shorter, the AGT period/prescaler is off.
+//   • millis_s = MCU millis() across the sleep. Should be ~0 in TRUE Software Standby (system
+//                clock stopped). If it instead tracks rtc_s, we were only in plain Sleep.
+//   • MR2 should read 0x87 (LPM=1 + CKS=/128) and d≈25 — proof the init-order fix latched.
+static void sleepCycleTest() {
+    static uint16_t cycle = 0;
+    char d[176];
+    cycle++;
+
+    // ---- AWAKE window: LED solid ON ----
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
+    snprintf(d, sizeof(d), "cycle=%u AWAKE_START %lums", (unsigned)cycle,
+             (unsigned long)SLEEP_TEST_AWAKE_MS);
+    writeStatusLog("SLEEPTEST", d);
+    uint32_t aw = millis();
+    while (millis() - aw < SLEEP_TEST_AWAKE_MS) {
+        delay(10000);                                  // heartbeat: proves we're alive & timing
+        snprintf(d, sizeof(d), "cycle=%u awake t=%lus", (unsigned)cycle,
+                 (unsigned long)((millis() - aw) / 1000));
+        writeStatusLog("SLEEPTEST", d);
+    }
+
+    // ---- arm the wake timer, record its state BEFORE sleeping ----
+    uint32_t counts = (uint32_t)SLEEP_TEST_SLEEP_MS * 256UL / 1000UL;
+    if (counts > 65535) counts = 65535;
+    setupAGT1Wakeup((uint16_t)counts);
+    uint16_t a1 = *AGT1_AGT; delay(100); uint16_t a2 = *AGT1_AGT;
+    snprintf(d, sizeof(d),
+             "cycle=%u pre_sleep load=%lu AGT %u->%u d=%d MR2=0x%02X AGTCR=0x%02X WUPEN=0x%08lX irq=%d hits=%lu",
+             (unsigned)cycle, (unsigned long)counts, (unsigned)a1, (unsigned)a2, (int)(a1 - a2),
+             (unsigned)*AGT1_AGTMR2, (unsigned)*AGT1_AGTCR,
+             (unsigned long)R_ICU->WUPEN, (int)g_agt1Irqn, (unsigned long)g_agt1IsrHits);
+    writeStatusLog("SLEEPTEST", d);
+
+    // ---- SLEEP: LED OFF ----
+    uint32_t rtc0 = queryRTC().unixtime();
+    uint32_t ms0  = millis();
+    digitalWrite(LED_BUILTIN, LOW);
+    softwareStandbySleep();            // ← UNDER TEST (sets LED HIGH the instant it wakes)
+    clearAGT1Flags();
+
+    // ---- WOKE ----
+    g_sd.begin(SD_CS_PIN, SD_SCK_MHZ(25));   // SPI/SD may need re-establishing after standby
+    wakeReinitKline();
+    uint32_t ms1  = millis();
+    uint32_t rtc1 = queryRTC().unixtime();
+    snprintf(d, sizeof(d), "cycle=%u WOKE rtc_s=%ld millis_s=%lu AGTCR=0x%02X hits=%lu",
+             (unsigned)cycle, (long)(rtc1 - rtc0),
+             (unsigned long)((ms1 - ms0) / 1000),
+             (unsigned)*AGT1_AGTCR, (unsigned long)g_agt1IsrHits);
+    writeStatusLog("SLEEPTEST", d);
+}
+#endif
+
+#if SLEEP_ONCE_TEST
+// ONE-SHOT sleep/wake test. Sleeps exactly once, wakes, then stays awake forever emitting
+// ALIVE heartbeats. Every stage is logged so the failure point is unambiguous:
+//   stage=1/2/3/4 present, nothing after  ⇒ entered standby, NEVER woke (wake still broken)
+//   stage=5 WOKE present                  ⇒ THE WAKE WORKS
+//   ALIVE lines after that                ⇒ it also survived the wake and kept running
+// stage=5 reports rtc_s (real seconds, external DS1307 keeps running) and millis_s (MCU clock,
+// ~0 in true Software Standby). MR2 should read 0x87 if the init-order fix latched.
+// ⚠ Touches NO LED before logging — LED_BUILTIN is pin 13 = SPI SCK, and driving it kills the
+// SD interface. softwareStandbySleep()'s post-wake LED write is followed by g_sd.begin() here
+// to put SCK back under SPI control before anything is written.
+static void sleepOnceTest() {
+    static bool slept = false;
+    static uint32_t hb = 0;
+    char d[184];
+
+    if (slept) {                                  // post-wake: stay awake, prove we're alive
+        if (millis() - hb >= 10000) {
+            hb = millis();
+            snprintf(d, sizeof(d), "ALIVE up=%lus AGTCR=0x%02X hits=%lu",
+                     (unsigned long)(millis() / 1000), (unsigned)*AGT1_AGTCR,
+                     (unsigned long)g_agt1IsrHits);
+            writeStatusLog("SLEEP1", d);
+        }
+        return;
+    }
+
+    writeStatusLog("SLEEP1", "stage=1 test start (SD known good, no LED touched yet)");
+
+    snprintf(d, sizeof(d), "stage=2 LCSTP=%u SBYCR=0x%04X SCR=0x%08lX WUPEN=0x%08lX",
+             (unsigned)R_SYSTEM->LOCOCR_b.LCSTP, (unsigned)R_SYSTEM->SBYCR,
+             (unsigned long)SCB->SCR, (unsigned long)R_ICU->WUPEN);
+    writeStatusLog("SLEEP1", d);
+
+    probeAgt1Matrix();                            // ◄── which count-source config actually ticks?
+
+    uint32_t counts = (uint32_t)SLEEP_ONCE_MS * 256UL / 1000UL;
+    if (counts > 65535) counts = 65535;
+    setupAGT1Wakeup((uint16_t)counts);
+    uint16_t a1 = *AGT1_AGT; delay(100); uint16_t a2 = *AGT1_AGT;
+    snprintf(d, sizeof(d),
+             "stage=3 armed load=%lu AGT %u->%u d=%d MR1=0x%02X MR2=0x%02X AGTCR=0x%02X irq=%d hits=%lu",
+             (unsigned long)counts, (unsigned)a1, (unsigned)a2, (int)(a1 - a2),
+             (unsigned)*AGT1_AGTMR1, (unsigned)*AGT1_AGTMR2, (unsigned)*AGT1_AGTCR,
+             (int)g_agt1Irqn, (unsigned long)g_agt1IsrHits);
+    writeStatusLog("SLEEP1", d);
+
+    uint32_t rtc0 = queryRTC().unixtime();
+    uint32_t ms0  = millis();
+    snprintf(d, sizeof(d), "stage=4 SLEEPING NOW %lums rtc0=%lu ms0=%lu",
+             (unsigned long)SLEEP_ONCE_MS, (unsigned long)rtc0, (unsigned long)ms0);
+    writeStatusLog("SLEEP1", d);
+
+    softwareStandbySleep();                       // ◄── THE THING UNDER TEST
+    clearAGT1Flags();
+
+    // Restore SPI/SD: the post-wake LED write inside softwareStandbySleep() left pin 13 (SCK)
+    // as GPIO, which would make every write below fail silently.
+    g_sd.begin(SD_CS_PIN, SD_SCK_MHZ(25));
+    wakeReinitKline();
+
+    uint32_t ms1  = millis();
+    uint32_t rtc1 = queryRTC().unixtime();
+    snprintf(d, sizeof(d),
+             "stage=5 WOKE rtc_s=%ld millis_s=%lu AGTCR=0x%02X MR2=0x%02X hits=%lu",
+             (long)(rtc1 - rtc0), (unsigned long)((ms1 - ms0) / 1000),
+             (unsigned)*AGT1_AGTCR, (unsigned)*AGT1_AGTMR2,
+             (unsigned long)g_agt1IsrHits);
+    writeStatusLog("SLEEP1", d);
+    slept = true;
+    hb = millis();
+}
+#endif
+
 void loop() {
+
+#if SLEEP_ONCE_TEST
+    // Only run the test when there is NO USB host. On host power fall through to the MSC branch
+    // below so the card (and the previous run's SLEEP1 lines) can actually be read — standby
+    // tears down USB and never brings it back, so a sleeping board is invisible either way.
+    if (!g_mscMode) {
+        sleepOnceTest();              // one-shot sleep test owns the loop
+        return;
+    }
+#endif
+
+#if SLEEP_CYCLE_TEST
+    sleepCycleTest();                 // bench harness owns the loop; phase machine bypassed
+    return;
+#endif
 
     // USB Mass Storage mode: the core's USB thread serves the SD as a drive;
     // the logger does not run. (Latched at boot in setup().)
@@ -2809,11 +3256,18 @@ void loop() {
             return;
         }
 
+#if STANDBY_ENABLED
         if (millis() - g_searchStartMs >= PHASE1_SEARCH_DURATION_MS) {
             g_searchStartMs = 0;
             g_phase = PHASE_IDLE;
             Serial.println(F("[PHASE] Search timeout → IDLE (2-min sleep)"));
         }
+#else
+        // STANDBY_ENABLED==0: never hand off to the (currently unwakeable) standby path.
+        // Re-arm the window and keep fast-searching so an engine restart is ALWAYS caught.
+        if (millis() - g_searchStartMs >= PHASE1_SEARCH_DURATION_MS)
+            g_searchStartMs = millis();
+#endif
     }
 
     // ================================================================
@@ -2823,10 +3277,45 @@ void loop() {
         uint32_t counts = (uint32_t)PHASE1_IDLE_SLEEP_MS * 256UL / 1000UL;
         if (counts > 65535) counts = 65535;
         setupAGT1Wakeup((uint16_t)counts);
+
+#if STANDBY_FAST_TEST
+        // DIAGNOSTIC (awake, so the SD works): is the AGT actually COUNTING DOWN? At
+        // AGTLCLK/128 = 256 Hz it should drop ~25 counts in 100 ms. d==0 ⇒ the timer has no
+        // clock (LOCO/AGTLCLK problem) and can never underflow to wake us; d≈25 ⇒ the timer is
+        // fine and the fault is in the wake path (WUPEN / event link), not the clock.
+        {
+            uint16_t a1 = *AGT1_AGT;
+            delay(100);
+            uint16_t a2 = *AGT1_AGT;
+            char dbg[144];
+            snprintf(dbg, sizeof(dbg),
+                     "AGT %u->%u d=%d LCSTP=%u WUPEN=0x%08lX AGTCR=0x%02X MR2=0x%02X irq=%d hits=%lu",
+                     (unsigned)a1, (unsigned)a2, (int)(a1 - a2),
+                     (unsigned)R_SYSTEM->LOCOCR_b.LCSTP,
+                     (unsigned long)R_ICU->WUPEN, (unsigned)*AGT1_AGTCR,
+                     (unsigned)*AGT1_AGTMR2, (int)g_agt1Irqn,
+                     (unsigned long)g_agt1IsrHits);
+            writeStatusLog("AGT_DBG", dbg);
+        }
+#endif
+
+        // 2 SHORT blinks = "entering Software Standby now" (proves the sleep path was reached).
+        blinkLed(2, 80);
+
         softwareStandbySleep();
         clearAGT1Flags();
 
-        // Re-init the UART + transceiver that Software Standby stalled, BEFORE probing.
+        // 3 LONG blinks = "woke from Software Standby" (proves the AGT1 wake fired). Diagnosis:
+        // no blinks at all   -> never reached standby (hung/faulted earlier)
+        // 2 shorts, no longs -> entered standby but never woke  (wake still broken)
+        // 2 shorts + 3 longs -> WOKE. If no IDLE_WAKE line also appears, the SD write is the
+        //                      problem, not the wake.
+        blinkLed(3, 300);
+
+        // Software Standby can leave the SPI/SD and the SCI stalled. Re-establish BOTH before
+        // any SD write or probe — otherwise the IDLE_WAKE line vanishes silently and a working
+        // wake looks like a dead one.
+        g_sd.begin(SD_CS_PIN, SD_SCK_MHZ(25));
         wakeReinitKline();
 
         // Mark the wake so the next log distinguishes "woke, probed, found nothing"
