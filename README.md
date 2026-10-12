@@ -1,6 +1,6 @@
 Stand alone high speed K-Line logging to an sdcard using an arduino. Canbus support is a work in progress. Although no Romraider Logger code was used directly it was an essential guide to get "fast polling" of ecu data. That project can be found at https://github.com/RomRaider/RomRaider
 
-## Firmware — alpha8.0
+## Firmware — alpha8.1
 
 Standalone SSM (K-Line) data logger for the **Arduino Uno R4 Minima**. Reads RomRaider
 `logger.xml` profiles + `logger_*.xml` definitions from the SD card, builds a complete
@@ -8,7 +8,7 @@ per-ECU parameter dictionary, and logs to CSV via SSM fast-poll (continuous) bat
 Auto-generates a profile when the ECU is unknown or no `logger.xml` is present.
 
 - **Source:** `firmware/sssal/sssal.ino`
-- **Compiled binary:** `firmware/binaries/sssal_alpha8.bin` / `.hex`
+- **Compiled binary:** `firmware/binaries/sssal_alpha81.bin` / `.hex`
 - **Build:** `arduino-cli compile --fqbn arduino:renesas_uno:minima` (libs: SdFat 2.3.0, RTClib 2.1.4, Arduino_CAN). **USB-MSC requires two one-line core patches — see [`firmware/BUILD_NOTES.md`](firmware/BUILD_NOTES.md).**
 - **Flash:** `arduino-cli upload -p <COMx> --fqbn arduino:renesas_uno:minima` (Renesas RA4M1, DFU).
 
@@ -64,6 +64,25 @@ in the full-speed MSC endpoint descriptor).
   compile-time switch; set it to `0` for the fast-search build that stays awake (~7.5 mA parked)
   if a standby problem is ever suspected. `status.log` now rotates at 32 KB instead of 2 KB so the
   `IDLE_WAKE` history survives a long park. *(On-car key-off verification still pending.)*
+- **alpha8.1:** stop advertising a broken disk. The MSC interface is always in the USB
+  descriptor — `__USBInstallMSD()` is resolved at link time and the core assigns `install_MSD`
+  during static init, before `setup()` runs — so a host always finds a mass-storage device even
+  on a boot that goes to logger mode. TinyUSB only defaults to `MEDIUM NOT PRESENT` when no
+  sense is already set (`if (p_msc->sense_key == 0)`), and sense data is sticky until a
+  `REQUEST SENSE` clears it, so a stale key from any earlier failed command masked it and
+  Windows offered to **format the card holding the only copy of the logs**. Every not-serving
+  path now sets the sense explicitly (`SCSI_SENSE_NOT_READY`, ASC `0x3A`) and
+  `tud_msc_capacity_cb` reports `0/0` so `READ CAPACITY` stalls with the same status — the host
+  sees an empty card-reader slot, which is what the device actually is. Read/write failures
+  while serving now report `MEDIUM ERROR` with a real ASC instead of a bare `-1`.
+  Also fixed: a failed `enterMscMode()` used to `return` from `setup()` anyway, leaving the board
+  neither serving the card nor logging, with nothing in `status.log` to explain it; it now falls
+  through to logger mode.
+
+  **Pulling logs:** the MSC-vs-logger choice is latched once at boot. Plugging a laptop into an
+  already-powered board does not produce a drive — power-cycle it so it boots with the host
+  attached. With standby enabled a parked board is usually asleep, and USB is deliberately not a
+  standby wake source, so it will not enumerate until its next AGT1 underflow.
 
 ### Pre-flight tool (`tools/SsmInitTiming.cs`)
 A PC-side J2534 validator (Tactrix OpenPort 2.0) that checks everything the firmware relies

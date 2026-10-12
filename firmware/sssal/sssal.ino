@@ -82,7 +82,7 @@ extern "C" {
 #elif !STANDBY_ENABLED
 #define SSSAL_VERSION        "alpha7.9-nosleep"  // logging build; standby path disabled
 #else
-#define SSSAL_VERSION        "alpha8.0"          // emitted in the log provenance remark
+#define SSSAL_VERSION        "alpha8.1"          // emitted in the log provenance remark
 #endif
 
 // -- Hardware pins --
@@ -2831,7 +2831,30 @@ static bool enterMscMode() {
     return true;
 }
 
+// True only when the card is genuinely available as a raw block device for the host.
+// Everything below keys off this: if we are not serving, every SCSI command must answer
+// "no medium" rather than "ready but empty", or the host concludes the disk is unformatted.
+static inline bool mscServing() {
+    return g_mscMode && g_mscCard && g_mscSectors > 0;
+}
+
 // ---- TinyUSB MSC device callbacks (USB device task runs in the core's ThreadX thread) ----
+//
+// ★ "DO YOU WANT TO FORMAT THIS DISK?" FIX (alpha8.1)
+// __USBInstallMSD() above is resolved at LINK time and the core assigns `install_MSD` during
+// static init, before setup() runs — so the MSC interface is ALWAYS present in the USB
+// descriptor, including on a boot that goes to logger mode. A host therefore ALWAYS finds a
+// mass-storage device here, whether or not we intend to serve the card. There is no way to
+// gate the descriptor at runtime without patching the core.
+// The core does default to NOT READY / MEDIUM NOT PRESENT on a failed TEST UNIT READY, but
+// ONLY `if (p_msc->sense_key == 0)` (tinyusb/class/msc/msc_device.c:667, :704, :740) — the
+// sense is sticky until a REQUEST SENSE clears it, so any earlier failed command leaves a
+// stale key that masks "no medium". The host then sees a present-but-unreadable disk and
+// offers to format the card holding the only copy of the logs.
+// ⇒ Set the sense EXPLICITLY on every not-serving path so the answer cannot be ambiguous.
+// (0x3A = MEDIUM NOT PRESENT, which is what an empty card-reader slot reports.)
+// Writes were already refused when not serving, so data was never reachable — but that is a
+// guard rail, not an excuse for advertising a broken disk.
 extern "C" {
 void tud_msc_inquiry_cb(uint8_t lun, uint8_t vid[8], uint8_t pid[16], uint8_t rev[4]) {
     (void)lun;
@@ -2840,27 +2863,41 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vid[8], uint8_t pid[16], uint8_t re
     memcpy(rev, "1.0 ",              4);
 }
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
-    (void)lun;
-    return g_mscMode && g_mscCard && g_mscSectors > 0;   // false unless MSC mode → no mid-logging corruption
+    if (mscServing()) return true;
+    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);   // MEDIUM NOT PRESENT
+    return false;
 }
 void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_size) {
-    (void)lun; *block_count = g_mscSectors; *block_size = 512;
+    (void)lun;
+    if (!mscServing()) {        // 0/0 makes the core stall READ CAPACITY with NOT READY
+        *block_count = 0; *block_size = 0; return;
+    }
+    *block_count = g_mscSectors; *block_size = 512;
 }
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) {
-    (void)lun; (void)power_condition; (void)start; (void)load_eject; return true;
+    (void)power_condition; (void)start; (void)load_eject;
+    if (mscServing()) return true;
+    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+    return false;               // do not claim a successful load/eject on an absent medium
 }
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
-    (void)lun; (void)offset;
-    if (!g_mscMode || !g_mscCard) return -1;
+    (void)offset;
+    if (!mscServing()) { tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00); return -1; }
     uint32_t ns = bufsize / 512; if (ns == 0) return -1;
-    if (!g_mscCard->readSectors(lba, (uint8_t*)buffer, ns)) return -1;
+    if (!g_mscCard->readSectors(lba, (uint8_t*)buffer, ns)) {
+        tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // UNRECOVERED READ ERROR
+        return -1;
+    }
     return (int32_t)(ns * 512);
 }
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
-    (void)lun; (void)offset;
-    if (!g_mscMode || !g_mscCard) return -1;
+    (void)offset;
+    if (!mscServing()) { tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00); return -1; }
     uint32_t ns = bufsize / 512; if (ns == 0) return -1;
-    if (!g_mscCard->writeSectors(lba, buffer, ns)) return -1;
+    if (!g_mscCard->writeSectors(lba, buffer, ns)) {
+        tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x03, 0x00);   // PERIPHERAL WRITE FAULT
+        return -1;
+    }
     return (int32_t)(ns * 512);
 }
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void* buffer, uint16_t bufsize) {
@@ -2880,8 +2917,14 @@ void setup() {
     digitalWrite(SLP_PIN, HIGH);
 
     // ---- USB-MSC mode latch ----
-    // If a USB host enumerates us within ~1.5s of boot we're on a PC → serve the SD
+    // If a USB host enumerates us within 5 s of boot we're on a PC → serve the SD
     // as a USB drive and skip the logger. In the car (no USB host) this falls through.
+    // ⚠ Latched ONCE, here. It is never re-evaluated, so a host that appears later (laptop
+    // plugged into a board already powered from OBD/charger) does NOT get a drive — the board
+    // stays in logger mode and MSC reports MEDIUM NOT PRESENT. To pull logs, power-cycle the
+    // board so it boots with the host attached. With standby enabled the board is also usually
+    // ASLEEP when parked, and USB is NOT a standby wake source (WUPEN bit 27 unset), so a
+    // sleeping board will not enumerate at all until its next AGT1 underflow.
     // NOTE: do NOT bypass this latch for the sleep harness. Tried that (alpha7.9-sleeptest, run
     // 2026-10-11 22:16): with MSC still advertised but g_mscMode false, the board wrote its 4
     // setup lines and then nothing at all — the harness never reached its first statement. The
@@ -2891,17 +2934,22 @@ void setup() {
         uint32_t t0 = millis();
         // 5 s, not 1.5 s: after a DFU flash the host re-enumerates slowly and 1.5 s often timed
         // out, leaving the board in logger mode while still ADVERTISING a mass-storage device.
-        // Windows then sees a 0-sector/not-ready drive and pops "You need to format the disk" —
-        // aimed at the card holding the only copy of the logs. A longer window makes the drive
-        // mount reliably instead. (Proper fix: don't advertise MSC at all unless serving it.)
+        // Windows then saw a 0-sector drive and popped "You need to format the disk" — aimed at
+        // the card holding the only copy of the logs. The longer window makes the drive mount
+        // reliably; the format prompt itself is fixed in the MSC callbacks above, which now
+        // report MEDIUM NOT PRESENT (an empty card-reader slot) whenever we are not serving.
         while (!tud_mounted() && (millis() - t0) < 5000) { delay(10); }
         if (tud_mounted()) {
-            if (enterMscMode())
+            if (enterMscMode()) {
                 Serial.println(F("[BOOT] USB host detected -> USB Mass Storage mode (SD as drive)"));
-            else
-                Serial.println(F("[BOOT] USB host detected but SD block init FAILED"));
-            digitalWrite(LED_BUILTIN, HIGH);   // solid = MSC mode
-            return;                             // skip logger init; USB thread serves the drive
+                digitalWrite(LED_BUILTIN, HIGH);   // solid = MSC mode
+                return;                            // skip logger init; USB thread serves the drive
+            }
+            // ★ FIXED alpha8.1: this used to `return` even when enterMscMode() FAILED, leaving
+            // the board in a do-nothing state — not serving the card (g_mscMode false) and not
+            // logging either, with no status.log entry to say why. Fall through to logger init
+            // instead; MSC now correctly reports MEDIUM NOT PRESENT for the whole session.
+            Serial.println(F("[BOOT] USB host detected but SD block init FAILED -> logger mode"));
         }
     }
 

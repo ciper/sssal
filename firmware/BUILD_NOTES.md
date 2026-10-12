@@ -56,3 +56,37 @@ Enabling the class is not enough — the core only advertises MSC in the USB des
 sketch defines the weak presence function `void __USBInstallMSD() {}` (C++ linkage, no
 `extern "C"`). The sketch also implements the `tud_msc_*` callbacks against the SdFat block
 device and latches MSC-vs-logger mode at boot via `tud_mounted()`.
+
+### MSC is always advertised — why the callbacks must report "no medium"
+`__USBInstallMSD()` is resolved at **link** time and the core assigns `install_MSD` during
+static init, *before* `setup()` runs. The MSC interface is therefore always in the USB
+descriptor, including on a boot that goes to logger mode, and there is no way to gate the
+descriptor at runtime without patching the core further. A host always finds a mass-storage
+device, whether or not the sketch intends to serve the card.
+
+TinyUSB does default to `NOT READY / MEDIUM NOT PRESENT` on a failed `TEST UNIT READY`, but
+only `if (p_msc->sense_key == 0)` — see `tinyusb/class/msc/msc_device.c` lines 667, 704 and
+740. Sense data is sticky until a `REQUEST SENSE` clears it, so any earlier failed command
+leaves a stale key that masks "no medium". The host then treats the disk as present but
+unreadable and offers to **format the card holding the only copy of the logs**.
+
+So every not-serving path in the `tud_msc_*` callbacks sets the sense explicitly:
+
+```c
+tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);   // 0x3A = MEDIUM NOT PRESENT
+```
+
+and `tud_msc_capacity_cb` reports `block_count = 0, block_size = 0` so the core stalls
+`READ CAPACITY` with the same status. The host then shows an empty card-reader slot, which is
+exactly what the device is at that moment.
+
+### Pulling logs off the card
+The MSC-vs-logger decision is latched **once**, at boot, and never re-evaluated. Plugging a
+laptop into a board that is already powered (from OBD or a charger) does **not** produce a
+drive — the board stays in logger mode and reports no medium. Power-cycle the board so it boots
+with the host attached.
+
+With `STANDBY_ENABLED 1` the board is also usually in Software Standby when parked, and USB is
+**not** a standby wake source (`WUPEN` bit 27 is deliberately left unset — only bit 28, the AGT1
+underflow, is enabled). A sleeping board will not enumerate on USB at all until its next AGT1
+underflow, and will then wake into logger mode. Power-cycling is the only reliable path.
