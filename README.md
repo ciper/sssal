@@ -1,6 +1,6 @@
 Stand alone high speed K-Line logging to an sdcard using an arduino. Canbus support is a work in progress. Although no Romraider Logger code was used directly it was an essential guide to get "fast polling" of ecu data. That project can be found at https://github.com/RomRaider/RomRaider
 
-## Firmware — alpha8.1
+## Firmware — alpha8.2
 
 Standalone SSM (K-Line) data logger for the **Arduino Uno R4 Minima**. Reads RomRaider
 `logger.xml` profiles + `logger_*.xml` definitions from the SD card, builds a complete
@@ -8,7 +8,7 @@ per-ECU parameter dictionary, and logs to CSV via SSM fast-poll (continuous) bat
 Auto-generates a profile when the ECU is unknown or no `logger.xml` is present.
 
 - **Source:** `firmware/sssal/sssal.ino`
-- **Compiled binary:** `firmware/binaries/sssal_alpha81.bin` / `.hex`
+- **Compiled binary:** `firmware/binaries/sssal_alpha82.bin` / `.hex`
 - **Build:** `arduino-cli compile --fqbn arduino:renesas_uno:minima` (libs: SdFat 2.3.0, RTClib 2.1.4, Arduino_CAN). **USB-MSC requires two one-line core patches — see [`firmware/BUILD_NOTES.md`](firmware/BUILD_NOTES.md).**
 - **Flash:** `arduino-cli upload -p <COMx> --fqbn arduino:renesas_uno:minima` (Renesas RA4M1, DFU).
 
@@ -63,7 +63,9 @@ in the full-speed MSC endpoint descriptor).
   wake, then stable operation. Parked draw drops from ~7.5 mA to ~40 µA. `STANDBY_ENABLED` is a
   compile-time switch; set it to `0` for the fast-search build that stays awake (~7.5 mA parked)
   if a standby problem is ever suspected. `status.log` now rotates at 32 KB instead of 2 KB so the
-  `IDLE_WAKE` history survives a long park. *(On-car key-off verification still pending.)*
+  `IDLE_WAKE` history survives a long park. **On-car verified 2026-10-12 (on alpha8.1):** one
+  boot, then 70 consecutive 2-minute standby wakes across two parks, with two separate drives
+  detected and logged straight out of standby — no reboot, no lost drive.
 - **alpha8.1:** stop advertising a broken disk. The MSC interface is always in the USB
   descriptor — `__USBInstallMSD()` is resolved at link time and the core assigns `install_MSD`
   during static init, before `setup()` runs — so a host always finds a mass-storage device even
@@ -83,6 +85,22 @@ in the full-speed MSC endpoint descriptor).
   already-powered board does not produce a drive — power-cycle it so it boots with the host
   attached. With standby enabled a parked board is usually asleep, and USB is deliberately not a
   standby wake source, so it will not enumerate until its next AGT1 underflow.
+- **alpha8.2:** code-review fixes.
+  - **A corrupt K-line frame no longer ends the log.** Any header/checksum error used to be
+    treated exactly like the stream stopping, so one bad byte closed the log and restarted the
+    ECU search (and `status.log` said "no data" either way). The reader now matches the
+    `80 F0 10 <N+1> E8` header byte by byte, skips bad or cut-off frames, and resyncs on the next
+    one; the log only closes after 5 s with no *valid* frame. Skipped frames are reported per log
+    as `STREAM_ERRORS <file> bad_frames=N resync_bytes=M` (written only when nonzero; an
+    occasional `bad_frames=1` at key-off is a frame cut off by the engine stopping).
+  - **Second drive in one power-up no longer gains extra columns.** Hidden dependency params
+    pulled in for calculated params were re-loaded as visible columns on the next engine start —
+    a path that only became reachable once standby recovery worked.
+  - **Nothing-to-log selections** (every selected param unsupported) write one
+    `NO_FETCHABLE_PARAMS` line per boot and sleep, instead of creating an empty log on every start.
+  - `BATCHMAX=` in `address_map.csv` is clamped to 48 (the probe's own ceiling); a hand-edited
+    value of 84+ overflowed the request builder.
+  - The K-line transceiver is put to sleep for each standby window (woken again before the probe).
 
 ### Pre-flight tool (`tools/SsmInitTiming.cs`)
 A PC-side J2534 validator (Tactrix OpenPort 2.0) that checks everything the firmware relies

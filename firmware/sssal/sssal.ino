@@ -82,7 +82,7 @@ extern "C" {
 #elif !STANDBY_ENABLED
 #define SSSAL_VERSION        "alpha7.9-nosleep"  // logging build; standby path disabled
 #else
-#define SSSAL_VERSION        "alpha8.1"          // emitted in the log provenance remark
+#define SSSAL_VERSION        "alpha8.2"          // emitted in the log provenance remark
 #endif
 
 // -- Hardware pins --
@@ -232,6 +232,11 @@ bool         g_rtcOk = false;
 // ---------------------------------------------------------------
 Param      g_sel[MAX_SELECTED];   // selected params (from logger.xml, loaded from cache)
 uint8_t    g_numSel = 0;
+// User-selected count as parsed from the profile, BEFORE buildFetchList() appends hidden CALC
+// deps to g_sel[]. handleEcuFound() resets g_numSel to this on every engine start: without it,
+// a 2nd start in the same boot (standby recovery) re-ran loadCacheForSelected() over the deps
+// too, which clears `hidden` — the deps then appeared as extra CSV columns.
+uint8_t    g_numSelUser = 0;
 
 FetchSlot  g_fetch[MAX_FETCH];    // batch request address list
 uint8_t    g_numFetch = 0;
@@ -292,6 +297,14 @@ uint8_t  g_batchReqLen = 0;
 bool     g_firstPacket = false;
 // Flag: set true if SD write fails mid-session; checked in loop() to close log + re-search
 bool     g_sdWriteError = false;
+// Per-log stream-integrity counters (reset at log open, reported at log close if nonzero).
+// A corrupt/misaligned batch frame is now skipped and the reader resyncs on the next header,
+// instead of ending the log (which used to be logged as STREAM_WATCHDOG "no data").
+uint16_t g_badFrames   = 0;   // frames with a bad header/length/checksum, or cut off mid-frame
+uint32_t g_resyncBytes = 0;   // bytes discarded while hunting for the next 80 F0 10 header
+// Set once per boot when the selection has nothing fetchable (all NOTFOUND), so the
+// NO_FETCHABLE_PARAMS line is written once rather than on every 2-min wake.
+bool     g_noFetchLogged = false;
 // Filename of the current open log file (set when file opened, used for status.log)
 char     g_logFilename[28] = {0};
 // Per-log time baseline: millis() latched at the first row, subtracted from every row so
@@ -468,38 +481,64 @@ static void ssmSendBatchRequest() {
 
 // ---- Batch response ----
 
-// Read one batch response into data[0..g_numDataBytes-1].
-// Validates header bytes and checksum.
-// Returns true on success, false on timeout or error.
-// timeoutMs: how long to wait for the first byte.
+// Read one VALID batch response into data[0..g_numDataBytes-1].
+// Returns true on a valid frame; false ONLY when no valid frame arrived within timeoutMs
+// (the stream watchdog — engine off / ECU gone).
+// ★ alpha8.2: a corrupt or misaligned frame no longer ends the log. Previously ANY header/
+// checksum error returned false, the caller treated it exactly like a timeout, and one bad
+// K-line byte closed the log and re-entered search (logged as "no data" — indistinguishable;
+// suspected on 2026-10-08 20:23:26, re-found 3 s later). Now the 5 header bytes are matched
+// incrementally (a stray 0x80 inside data is rejected within 1-2 bytes and a 0x80 at the
+// mismatch point restarts the match), bad frames are counted in g_badFrames, discarded
+// bytes in g_resyncBytes, and the reader keeps hunting until the watchdog expires.
 static bool ssmReadBatchResponse(uint8_t *data, uint32_t timeoutMs) {
-    // Response: 80 F0 10 <N+1> E8 <N data bytes> <cs>
-    // Total bytes = g_numDataBytes + 6
-    uint8_t totalLen = g_numDataBytes + 6;
+    // Response: 80 F0 10 <N+1> E8 <N data bytes> <cs>   (total = N + 6 bytes)
+    const uint8_t totalLen = g_numDataBytes + 6;
+    const uint8_t hdr[5] = { 0x80, 0xF0, 0x10, (uint8_t)(g_numDataBytes + 1), 0xE8 };
     uint8_t buf[MAX_BATCH_DATA + 6];   // worst case: 192 data bytes + 6 framing
+    uint32_t start = millis();
 
-    // First byte with caller-specified timeout (watchdog)
-    int b = ssmReadByte(timeoutMs);
-    if (b < 0) return false;
-    buf[0] = (uint8_t)b;
+    for (;;) {
+        uint32_t elapsed = millis() - start;
+        if (elapsed >= timeoutMs) return false;
 
-    // Remaining bytes with generous per-byte timeout
-    for (uint8_t i = 1; i < totalLen; i++) {
-        b = ssmReadByte(200);
-        if (b < 0) return false;
-        buf[i] = (uint8_t)b;
+        // ---- Header sync: match 80 F0 10 <N+1> E8 byte by byte ----
+        uint8_t h = 0;
+        while (h < 5) {
+            elapsed = millis() - start;
+            if (elapsed >= timeoutMs) return false;
+            // First byte waits up to the remaining watchdog; inside a header, 200 ms per byte.
+            int b = ssmReadByte(h == 0 ? (timeoutMs - elapsed) : 200);
+            if (b < 0) {
+                if (h > 0) g_badFrames++;     // header cut off mid-way
+                h = 0;
+                continue;                     // loop re-checks the watchdog
+            }
+            if ((uint8_t)b == hdr[h]) { buf[h++] = (uint8_t)b; continue; }
+            g_resyncBytes += h + 1;           // matched prefix + this byte are discarded...
+            if ((uint8_t)b == 0x80) {         // ...unless this byte can start a new header
+                g_resyncBytes--;
+                buf[0] = 0x80; h = 1;
+            } else {
+                h = 0;
+            }
+        }
+
+        // ---- Body: N data bytes + checksum ----
+        bool cut = false;
+        for (uint8_t i = 5; i < totalLen; i++) {
+            int b = ssmReadByte(200);
+            if (b < 0) { cut = true; break; }
+            buf[i] = (uint8_t)b;
+        }
+        if (cut || buf[totalLen - 1] != ssmChecksum(buf, totalLen)) {
+            g_badFrames++;                    // drop it and resync on the next header
+            continue;
+        }
+
+        memcpy(data, buf + 5, g_numDataBytes);   // buf[5..5+N-1]
+        return true;
     }
-
-    // Validate header and data-length field (buf[3] = g_numDataBytes + 1 for 0xE8 command)
-    if (buf[0] != 0x80 || buf[1] != 0xF0 || buf[2] != 0x10 ||
-        buf[3] != (uint8_t)(g_numDataBytes + 1) || buf[4] != 0xE8) return false;
-
-    // Validate checksum
-    if (buf[totalLen - 1] != ssmChecksum(buf, totalLen)) return false;
-
-    // Copy data bytes (buf[5..5+N-1]) to caller's buffer
-    memcpy(data, buf + 5, g_numDataBytes);
-    return true;
 }
 
 // ---- Probe max batch size ----
@@ -1068,6 +1107,7 @@ bool parseProfile(const char *path) {
         }
     }
     f.close();
+    g_numSelUser = g_numSel;   // user selection only — deps are appended later (buildFetchList)
     return (g_numSel > 0);
 }
 
@@ -1533,7 +1573,10 @@ uint8_t checkCacheHeaders() {
     {
         int v = atoi(line + 9);
         if (v < 1) v = SSM_BATCH_DEFAULT;
-        if (v > MAX_SSM_ADDR) v = MAX_SSM_ADDR;
+        // Clamp to MAX_FETCH (48), the same ceiling ssmProbeMaxBatch() applies — NOT MAX_SSM_ADDR
+        // (84). ssmBuildBatchRequest() indexes g_batchReq with a uint8_t, so a hand-edited or
+        // corrupt BATCHMAX >= 84 (84*3+6 = 258 bytes) wrapped the index and built a garbage request.
+        if (v > MAX_FETCH) v = MAX_FETCH;
         g_maxBatchAddrs = (uint8_t)v;
     }
 
@@ -2238,6 +2281,8 @@ static bool openLogFile(const char *filename) {
     }
     g_writeBufPos  = 0;
     g_sdWriteError = false;
+    g_badFrames    = 0;
+    g_resyncBytes  = 0;
     g_lastSync     = millis();
     g_logStartSet  = false;   // re-baseline the time column for this new log
     writeLogHeader();
@@ -2250,6 +2295,14 @@ static void closeLogFile() {
     g_logFile.truncate();
     g_logFile.sync();
     g_logFile.close();
+    // Stream integrity for this log: frames skipped by the resync reader (they used to end
+    // the log). Only written when nonzero, so clean logs add no line.
+    if (g_badFrames || g_resyncBytes) {
+        char det[72];
+        snprintf(det, sizeof(det), "%s bad_frames=%u resync_bytes=%lu",
+                 g_logFilename, (unsigned)g_badFrames, (unsigned long)g_resyncBytes);
+        writeStatusLog("STREAM_ERRORS", det);
+    }
     // Orderly-close marker. A file whose name has NO matching LOG_CLOSED line in
     // status.log ended on a power cut — its last CSV line may be truncated (data since
     // the last 1 s sync is lost), so a parser should discard that file's final row.
@@ -2697,6 +2750,10 @@ static void fatalHalt(const char *event, const char *detail) {
 static bool g_ecuIdNotFound = false;  // set in handleEcuFound when ROM matched no ecuparam (unknown ECU)
 
 static void handleEcuFound() {
+    // Drop hidden CALC deps appended by the previous engine start's buildFetchList() so the
+    // loader below only re-resolves the USER selection (see g_numSelUser).
+    g_numSel = g_numSelUser;
+
     char detail[48];
     snprintf(detail, sizeof(detail), "ROM ID=%s", g_romId);
     writeStatusLog("ECU_FOUND", detail);
@@ -2773,6 +2830,24 @@ static void handleEcuFound() {
         writeStatusLog("ECU_SUPPORTED", det);
     }
 
+    // Build the fetch list BEFORE opening a file (it touches no file state), so a selection
+    // with nothing to fetch can bail out without creating an empty log.
+    buildFetchList();
+
+    // Nothing fetchable (every selected param NOTFOUND): the A8 request would carry zero
+    // addresses, the ECU never streams, and every engine start produced an empty log + an
+    // instant watchdog. Report once per boot and park in IDLE (re-probes every 2 min, silently)
+    // until the profile is fixed and the board power-cycled.
+    if (g_protocol == PROTO_SSM && g_numFetch == 0) {
+        if (!g_noFetchLogged) {
+            writeStatusLog("NO_FETCHABLE_PARAMS",
+                           "no selected param is supported by this ECU — fix logger.xml; not logging");
+            g_noFetchLogged = true;
+        }
+        g_phase = PHASE_IDLE;
+        return;
+    }
+
     // Build filename and open log file BEFORE incrementing counter.
     // Counter is only incremented if the file opens successfully — prevents
     // skipped session numbers on SD-full or other open failures.
@@ -2788,7 +2863,6 @@ static void handleEcuFound() {
 
     Serial.print(F("[LOG] ")); Serial.println(g_logFilename);
 
-    buildFetchList();
     if (g_protocol == PROTO_SSM) ssmSendBatchRequest();   // K-line streams; CAN would poll per-cycle (stub)
 
     g_firstPacket = true;
@@ -3350,6 +3424,12 @@ void loop() {
         // 2 SHORT blinks = "entering Software Standby now" (proves the sleep path was reached).
         blinkLed(2, 80);
 
+        // Put the K-line transceiver to sleep for the standby window (SLP LOW = sleep). It used
+        // to stay in normal mode through every 2-min standby, drawing current for nothing.
+        // wakeReinitKline() drives it HIGH again (a LOW->HIGH edge = back to normal mode) before
+        // the probe below.
+        digitalWrite(SLP_PIN, LOW);
+
         softwareStandbySleep();
         clearAGT1Flags();
 
@@ -3422,7 +3502,7 @@ void loop() {
         }
 
         if (timedOut) {
-            writeStatusLog("STREAM_WATCHDOG", "no data — re-entering Phase 1");
+            writeStatusLog("STREAM_WATCHDOG", "no valid frame for 5 s — re-entering Phase 1");
             Serial.println(F("[PHASE] Watchdog → close log, SEARCH"));
             flushBuffer();
             closeLogFile();
