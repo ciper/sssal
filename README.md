@@ -1,6 +1,6 @@
 Stand alone high speed K-Line logging to an sdcard using an arduino. Canbus support is a work in progress. Although no Romraider Logger code was used directly it was an essential guide to get "fast polling" of ecu data. That project can be found at https://github.com/RomRaider/RomRaider
 
-## Firmware — alpha8.2
+## Firmware — alpha8.3
 
 Standalone SSM (K-Line) data logger for the **Arduino Uno R4 Minima**. Reads RomRaider
 `logger.xml` profiles + `logger_*.xml` definitions from the SD card, builds a complete
@@ -8,7 +8,7 @@ per-ECU parameter dictionary, and logs to CSV via SSM fast-poll (continuous) bat
 Auto-generates a profile when the ECU is unknown or no `logger.xml` is present.
 
 - **Source:** `firmware/sssal/sssal.ino`
-- **Compiled binary:** `firmware/binaries/sssal_alpha82.bin` / `.hex`
+- **Compiled binary:** `firmware/binaries/sssal_alpha83.bin` / `.hex`
 - **Build:** `arduino-cli compile --fqbn arduino:renesas_uno:minima` (libs: SdFat 2.3.0, RTClib 2.1.4, Arduino_CAN). **USB-MSC requires two one-line core patches — see [`firmware/BUILD_NOTES.md`](firmware/BUILD_NOTES.md).**
 - **Flash:** `arduino-cli upload -p <COMx> --fqbn arduino:renesas_uno:minima` (Renesas RA4M1, DFU).
 
@@ -101,6 +101,32 @@ in the full-speed MSC endpoint descriptor).
   - `BATCHMAX=` in `address_map.csv` is clamped to 48 (the probe's own ceiling); a hand-edited
     value of 84+ overflowed the request builder.
   - The K-line transceiver is put to sleep for each standby window (woken again before the probe).
+    *(On-car verified 2026-10-12: two key-on cycles detected straight out of standby.)*
+- **alpha8.3:** bug-sweep fixes.
+  - **E-params no longer lost for 77 ROMs.** The definitions parser read lines into a 256-byte
+    buffer; 53 of the `<ecu id="...">` ROM lists in `logger_IMP_EN_v370.xml` are longer (up to
+    855 characters), so any ROM ID past the cut was never matched — 559 ROM×parameter pairs, up
+    to 29 E-params for one ROM. The parser now has its own 1 KB buffer and reports any line that
+    still overflows (`DEFS_LINE_TRUNCATED`). `address_map.csv` gains a `FMT=2` header line, so a
+    cache built by the old parser is rebuilt once (`CACHE_REGEN reason=BUILDER_UPDATE`, ~19 s).
+  - **A failed cache build can no longer stick.** The dictionary is built into
+    `address_map.tmp` and only renamed into place if the whole SSM section was read and written;
+    previously a defs read error or power loss mid-build left an empty/partial cache that was
+    reused forever. Failures log `CACHE_BUILD_FAIL` and retry at the next wake instead of halting.
+  - **No more 50 MB files after a power cut.** SdFat's `preAllocate()` sets the file size to the
+    full reservation immediately, so a log that never closed was 50 MB of rows plus stale card
+    data. Pre-allocation is removed (at ~0.5 KB/s it bought nothing); an unclosed log now ends at
+    the last 1 s sync.
+  - **Fatal errors no longer drain the battery, and their LED pattern is actually visible.** The
+    halt loop ran awake forever (~15 mA). It also blinked an LED that could not light: D13 is the
+    SD card's SPI clock, and `digitalWrite()` doesn't take a pin back from a peripheral. Fatal
+    states now flash a visible pattern for 60 s (4 blinks = config error, reason in `status.log`;
+    6 blinks = SD card failed), then sleep in Software Standby and repeat the pattern every ~4 min.
+    An empty profile is no longer fatal — it is reported as `NO_FETCHABLE_PARAMS` and parks.
+  - **`NO_FETCHABLE_PARAMS` is now really quiet:** later wakes that find the same ECU go back to
+    sleep instead of re-running detection and re-writing its status lines every 2 minutes.
+  - **Wake-timer re-arm waits for the timer to stop** before reconfiguring it, as Renesas' FSP
+    driver does. It worked before only because every re-arm wrote identical values.
 
 ### Pre-flight tool (`tools/SsmInitTiming.cs`)
 A PC-side J2534 validator (Tactrix OpenPort 2.0) that checks everything the firmware relies

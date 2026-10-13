@@ -82,7 +82,7 @@ extern "C" {
 #elif !STANDBY_ENABLED
 #define SSSAL_VERSION        "alpha7.9-nosleep"  // logging build; standby path disabled
 #else
-#define SSSAL_VERSION        "alpha8.2"          // emitted in the log provenance remark
+#define SSSAL_VERSION        "alpha8.3"          // emitted in the log provenance remark
 #endif
 
 // -- Hardware pins --
@@ -114,7 +114,10 @@ extern "C" {
 
 // -- SD write performance --
 #define WRITE_BUF_SIZE       512    // CSV write buffer; matches SD sector size
-#define PREALLOCATE_BYTES    (1024UL * 1024 * 50) // 50MB reserved upfront; avoids FAT chain updates
+// NO pre-allocation (removed alpha8.3). SdFat's preAllocate() sets the file SIZE to the full
+// reservation immediately (SdFat FatFile.cpp:750 `m_fileSize = length`), so a log that never got
+// an orderly close (power cut) was left 50 MB long with stale card sectors after the real rows.
+// At K-line rates (~0.5 KB/s) a new 32 KB cluster is needed only every ~60 s, so it bought nothing.
 #define SYNC_INTERVAL_MS     1000   // file.sync() every 1s; ~1-2ms at 25MHz SPI
 
 // -- status.log --
@@ -141,7 +144,8 @@ extern "C" {
                                     // operational limit is g_maxBatchAddrs (probed per-ECU).
 #define SSM_BATCH_DEFAULT    32     // fallback per-request address cap if the probe fails
 #define SSM_BATCH_MARGIN      2     // safety margin subtracted from the probed maximum
-#define CACHE_HEADER_LINES    5     // address_map.csv header lines: DEBUG,ECU,DEFS,BATCHMAX,columns
+#define CACHE_HEADER_LINES    6     // address_map.csv header lines: DEBUG,ECU,DEFS,BATCHMAX,FMT,columns
+#define CACHE_FORMAT_LINE    "FMT=2" // dictionary-builder version (see checkCacheHeaders)
 #define MAX_EXPR_LEN         96     // max chars in a formula expr= (OBD if() exprs reach ~71)
 #define MAX_NAME_LEN         48     // max characters in a param name
 #define MAX_ID_LEN           24     // max characters in a param ID (e.g. E_IMMO_4AD9_4ADB)
@@ -302,9 +306,9 @@ bool     g_sdWriteError = false;
 // instead of ending the log (which used to be logged as STREAM_WATCHDOG "no data").
 uint16_t g_badFrames   = 0;   // frames with a bad header/length/checksum, or cut off mid-frame
 uint32_t g_resyncBytes = 0;   // bytes discarded while hunting for the next 80 F0 10 header
-// Set once per boot when the selection has nothing fetchable (all NOTFOUND), so the
-// NO_FETCHABLE_PARAMS line is written once rather than on every 2-min wake.
-bool     g_noFetchLogged = false;
+// ROM ID of an ECU for which the selection has nothing fetchable (NO_FETCHABLE_PARAMS). While
+// set, IDLE wakes that find this same ECU go back to sleep without re-running detection.
+char     g_noFetchRom[11] = {0};
 // Filename of the current open log file (set when file opened, used for status.log)
 char     g_logFilename[28] = {0};
 // Per-log time baseline: millis() latched at the first row, subtracted from every row so
@@ -1124,6 +1128,7 @@ bool parseProfile(const char *path) {
 //   ECU=2F12515506
 //   DEFS=logger_IMP_EN_v370.xml
 //   BATCHMAX=38                          <- probed per-ECU SSM batch-read address cap
+//   FMT=2                                <- dictionary-builder version (mismatch → rebuild)
 //   param_id,name,address,len,type,endian,expr,units,deps
 //   P7,Manifold Pressure,0x00000D,1,u8,big,x/100,bar,
 //   P7,Manifold Pressure,0x00000D,1,u8,big,x*37/255,psi,
@@ -1267,6 +1272,7 @@ static bool ecuIdInLine(const char *line) {
 // The expr field is sanitised: XML entities (&gt; &lt; &amp;) are decoded to
 // > < & , and commas (which appear inside if(a,b,c)) are escaped to '|' so they
 // don't collide with the CSV delimiter. Cache loaders restore '|' → ',' on read.
+static uint16_t g_cacheRowsWritten = 0;   // rows written by the current regen (0 rows = failed build)
 static void writeCacheRow(SdFile &cf,
                            const char *pid, const char *pname,
                            uint32_t addr, uint8_t len,
@@ -1313,6 +1319,7 @@ static void writeCacheRow(SdFile &cf,
              (endian == END_BIG) ? "big" : "little",
              safeExpr, safeUnits[0] ? safeUnits : "-", deps);
     cf.print(row);
+    g_cacheRowsWritten++;
 }
 
 // Parse one <conversion ...> line and write a cache row for it (one units variant).
@@ -1348,15 +1355,28 @@ static void writeConversionRow(SdFile &cf, const char *line,
 // column lets loadCacheForSelected pick the row matching logger.xml, so changing which
 // params (or which units) you log never triggers a regen. Unsupported params are simply
 // omitted. Capability bytes must already be in g_ecuInitRaw[]/g_ecuInitLen.
-static void parseDefinitions(SdFile &cacheFile) {
+// Returns true only if the file opened AND the whole SSM section was read (its opening
+// <protocol id="SSM"> and closing </protocol> were both seen). A false return means the
+// dictionary is incomplete and must NOT be kept — see regenCache().
+//
+// ★ alpha8.3: own 1 KB line buffer. With the shared 256-byte LINE_BUF_SIZE, fgets() split long
+// lines, and 53 `<ecu id="...">` ROM lists in logger_IMP_EN_v370.xml are 256–855 chars. Any ROM
+// ID past ~char 244 was never seen, so 77 ROMs silently lost E-params (559 ROM×param pairs, up
+// to 29 for one ROM). 2F12515506 was unaffected (always early in its lists). Static, not stack:
+// 1 KB on the stack here is needless risk. Lines that still overflow are counted and reported.
+#define DEFS_LINE_BUF 1024
+void writeStatusLog(const char *event, const char *detail);  // SD OPS (defined below)
+static bool parseDefinitions(SdFile &cacheFile) {
     char defsPath[56];
     snprintf(defsPath, sizeof(defsPath), "/logger/%s", g_defsFilename);
 
     SdFile df;
-    if (!df.open(defsPath, O_READ)) return;
+    if (!df.open(defsPath, O_READ)) return false;
 
-    char line[LINE_BUF_SIZE];
+    static char line[DEFS_LINE_BUF];
     uint8_t state = DP_IDLE;
+    bool sawSectionEnd = false;
+    uint16_t longLines = 0;
 
     // Working param during scan
     char  wId[MAX_ID_LEN] = {0}, wName[MAX_NAME_LEN] = {0};
@@ -1369,7 +1389,11 @@ static void parseDefinitions(SdFile &cacheFile) {
     // not in the addresses/conversions — so always scan the SSM section.
     const char *targetSection = "id=\"SSM\"";
 
-    while (df.fgets(line, LINE_BUF_SIZE) > 0) {
+    int n;
+    while ((n = df.fgets(line, sizeof(line))) > 0) {
+        // A full buffer with no newline = this physical line was split. Count it (reported below).
+        if (n == (int)sizeof(line) - 1 && line[n - 1] != '\n') longLines++;
+
         // ---- IDLE: wait for target protocol section ----
         if (state == DP_IDLE) {
             if (strstr(line, "<protocol") && strstr(line, targetSection))
@@ -1378,7 +1402,7 @@ static void parseDefinitions(SdFile &cacheFile) {
         }
 
         // ---- Exit target protocol section (skip OBD/DS2/NCS) ----
-        if (strstr(line, "</protocol>")) break;
+        if (strstr(line, "</protocol>")) { sawSectionEnd = true; break; }
 
         // ====================================================
         if (state == DP_SSM) {
@@ -1527,6 +1551,14 @@ static void parseDefinitions(SdFile &cacheFile) {
     } // while fgets
 
     df.close();
+    if (longLines) {
+        char det[64];
+        snprintf(det, sizeof(det), "%u defs lines > %u chars; some E-params may be missing",
+                 (unsigned)longLines, (unsigned)(DEFS_LINE_BUF - 1));
+        writeStatusLog("DEFS_LINE_TRUNCATED", det);
+    }
+    // Hitting EOF / a read error before </protocol> leaves a partial dictionary.
+    return sawSectionEnd;
 }
 
 // ---- Cache file I/O ----
@@ -1537,8 +1569,9 @@ DateTime queryRTC();                                          // RTC OPS
 bool regenCache();                                           // SD OPS
 
 // Read address_map.csv header lines.
-// Header order: DEBUG= , ECU= , DEFS= , BATCHMAX= , then the column header.
-// Returns: 0 = file missing/old format, 1 = ROM ID mismatch, 2 = DEFS mismatch, 3 = OK.
+// Header order: DEBUG= , ECU= , DEFS= , BATCHMAX= , FMT= , then the column header.
+// Returns: 0 = file missing/old format, 1 = ROM ID mismatch, 2 = DEFS mismatch, 3 = OK,
+//          4 = built by an older dictionary builder (FMT mismatch).
 // Side effects: sets g_verboseDebug from DEBUG=, and g_maxBatchAddrs from BATCHMAX=.
 uint8_t checkCacheHeaders() {
     SdFile f;
@@ -1580,7 +1613,15 @@ uint8_t checkCacheHeaders() {
         g_maxBatchAddrs = (uint8_t)v;
     }
 
-    // Line 5: column header — validates the cache FORMAT. An old-format cache (no
+    // Line 5: FMT=<n> — dictionary-BUILDER version. Bumped when the parser changes what ends up
+    // in the cache, so caches built by an older parser are rebuilt once (the DEFS name alone
+    // can't tell). FMT=2 (alpha8.3): 1 KB defs line buffer — FMT-less caches were built by the
+    // 256-byte parser that dropped E-params for ROM IDs late in long `<ecu id=` lists.
+    if (f.fgets(line, sizeof(line)) <= 0) { f.close(); return 0; }
+    line[strcspn(line, "\r\n")] = '\0';
+    if (strcmp(line, CACHE_FORMAT_LINE) != 0) { f.close(); return 4; }
+
+    // Line 6: column header — validates the cache FORMAT. An old-format cache (no
     // units column) has the same DEBUG/ECU/DEFS but a different column header, so
     // this check forces a regen to the new format.
     if (f.fgets(line, sizeof(line)) <= 0) { f.close(); return 0; }
@@ -2165,12 +2206,16 @@ void rotateStatusLog() {
 // ---- Regenerate cache (implementation) ----
 
 // Full cache regeneration: scan definitions file, write new address_map.csv.
+// ★ alpha8.3: built into ADDR_MAP_TMP and renamed into place ONLY if the build is complete.
+// Before, address_map.csv was deleted, its headers written, then the defs scanned — and a defs
+// file that failed to open, a read error, or a power loss mid-scan (a rebuild takes ~19 s) left a
+// header-valid but empty/partial dictionary that CACHE_HIT forever (params silently NOTFOUND).
+// Now a failed build leaves no cache (or the previous one) and returns false → caller retries.
+#define ADDR_MAP_TMP "/logger/address_map.tmp"
 bool regenCache() {
-    // Open / create address_map.csv for writing
-    if (g_sd.exists(ADDR_MAP_FILE)) g_sd.remove(ADDR_MAP_FILE);
     SdFile cf;
-    if (!cf.open(ADDR_MAP_FILE, O_WRONLY | O_CREAT | O_TRUNC)) {
-        writeStatusLog("CACHE_WRITE_FAIL", "address_map.csv write failed");
+    if (!cf.open(ADDR_MAP_TMP, O_WRONLY | O_CREAT | O_TRUNC)) {
+        writeStatusLog("CACHE_BUILD_FAIL", "cannot create address_map.tmp");
         return false;
     }
 
@@ -2195,15 +2240,33 @@ bool regenCache() {
     cf.print(hdr);
     snprintf(hdr, sizeof(hdr), "BATCHMAX=%u\n", g_maxBatchAddrs);
     cf.print(hdr);
+    cf.print(F(CACHE_FORMAT_LINE "\n"));
     cf.print(F("param_id,name,address,len,type,endian,expr,units,deps\n"));
 
     // Build the COMPLETE per-ECU dictionary (every supported param, all unit variants).
     // Params the ECU doesn't support are simply omitted; a later selection of an
     // unsupported param is handled as NOTFOUND at load time (no regen).
-    parseDefinitions(cf);
-
-    cf.sync();
+    g_cacheRowsWritten = 0;
+    bool complete = parseDefinitions(cf);
+    bool written  = cf.sync() && !cf.getWriteError();
     cf.close();
+
+    if (!complete || !written || g_cacheRowsWritten == 0) {
+        char det[72];
+        snprintf(det, sizeof(det), "defs_complete=%u write_ok=%u rows=%u — will retry",
+                 (unsigned)complete, (unsigned)written, (unsigned)g_cacheRowsWritten);
+        writeStatusLog("CACHE_BUILD_FAIL", det);
+        g_sd.remove(ADDR_MAP_TMP);
+        return false;
+    }
+
+    // Swap in the finished cache. rename() refuses to overwrite, so remove the old one first;
+    // a power loss between the two just means no cache → rebuilt at the next ECU detection.
+    if (g_sd.exists(ADDR_MAP_FILE)) g_sd.remove(ADDR_MAP_FILE);
+    if (!g_sd.rename(ADDR_MAP_TMP, ADDR_MAP_FILE)) {
+        writeStatusLog("CACHE_BUILD_FAIL", "rename address_map.tmp failed — will retry");
+        return false;
+    }
     return true;
 }
 
@@ -2275,10 +2338,8 @@ static bool openLogFile(const char *filename) {
     char path[40];
     snprintf(path, sizeof(path), "/logger/%s", filename);
     if (!g_logFile.open(path, O_WRONLY | O_CREAT | O_TRUNC)) return false;
-    if (!g_logFile.preAllocate(PREALLOCATE_BYTES)) {
-        // Non-fatal: logging works without pre-allocation, just with higher SD latency
-        writeStatusLog("PREALLOC_WARN", "50MB pre-allocation failed — SD may be nearly full");
-    }
+    // (No preAllocate — see the note at WRITE_BUF_SIZE. The file grows as rows are written, so
+    // after a power cut its size is exactly what the last 1 s sync recorded.)
     g_writeBufPos  = 0;
     g_sdWriteError = false;
     g_badFrames    = 0;
@@ -2289,10 +2350,9 @@ static bool openLogFile(const char *filename) {
     return true;
 }
 
-// Flush, truncate to actual size, sync, and close the log file.
+// Flush, sync, and close the log file. (No truncate needed: nothing is pre-allocated.)
 static void closeLogFile() {
     flushBuffer();
-    g_logFile.truncate();
     g_logFile.sync();
     g_logFile.close();
     // Stream integrity for this log: frames skipped by the resync reader (they used to end
@@ -2525,6 +2585,15 @@ static void setupAGT1Wakeup(uint16_t counts) {
     // here as CKS(/128) and LPM never latching (~4.5 kHz instead of 256 Hz, MR2 LPM stuck 0).
     // Order: clear all AGT regs → cancel module-stop → count → AGTMR1 → AGTMR2 → TSTART.
     *AGT1_AGTCR    = 0;
+    // ★ alpha8.3: WAIT FOR THE STOP TO TAKE EFFECT before touching any other AGT register.
+    // From the 2nd park on, AGT1 is still RUNNING here (it keeps reloading after each wake), and
+    // the stop only lands after ~3 count-source cycles (≈12 ms at 256 Hz; the matching start
+    // delay measured 9 ms). FSP r_agt_common_preamble waits for TCSTF to equal TSTART, and the AGT
+    // usage notes forbid accessing other AGT registers meanwhile — the same class of rule whose
+    // violation (LPM before TCSTF) caused the original never-wake bug. It worked for 81 wakes only
+    // because every re-arm writes identical values. First call: the module is still stopped,
+    // TCSTF reads 0 and this falls straight through.
+    { uint32_t t0 = millis(); while ((*AGT1_AGTCR & 0x02u) && (millis() - t0) < 100) { } }
     *AGT1_AGTMR1   = 0;
     *AGT1_AGTMR2   = 0;
     *AGT1_AGTIOC   = 0;
@@ -2732,15 +2801,42 @@ static void blinkLed(uint8_t times, uint16_t onMs) {
 
 // ---- Fatal error halt ----
 
+// Terminal error state. Never returns; recovery needs a power cycle (every cause — missing defs,
+// bad card, protocol config — is fixed by editing the SD card, which needs a power cycle anyway).
+// ★ alpha8.3, two fixes:
+//  · VISIBLE: digitalWrite() only sets the port output level (R_IOPORT_PinWrite, core
+//    digital.cpp:22) — it does not take the pin back from a peripheral. D13 is SPI SCK, so once
+//    the SD was initialised every fatal blink was a no-op and the LED showed nothing. pinMode()
+//    hands D13 back to GPIO; safe here because the SD is never used again.
+//  · LOW POWER: the old halt spun awake forever (~15 mA ≈ 0.36 Ah/day on an always-powered OBD
+//    port). Now: show the pattern for 60 s (someone is likely at the car), then sleep in Software
+//    Standby, repeating the pattern once per ~4.3-min AGT1 wake (65535 counts / 256 Hz).
+// Patterns (250 ms on/off, bursts): 4 blinks = fatal config error (reason in status.log);
+//                                   6 blinks = SD card failed to initialise (no status.log possible).
+#define FATAL_BLINKS_CONFIG 4
+#define FATAL_BLINKS_SD     6
+static void haltLowPower(uint8_t blinks) {
+    uint32_t t0 = millis();
+    while (millis() - t0 < 60000UL) { blinkLed(blinks, 250); delay(1500); }   // blinkLed sets pinMode
+    for (;;) {
+#if STANDBY_ENABLED
+        digitalWrite(SLP_PIN, LOW);          // K-line transceiver asleep too
+        setupAGT1Wakeup(65535);              // max period ≈ 256 s
+        softwareStandbySleep();
+        clearAGT1Flags();
+#else
+        delay(4000);                         // standby compiled out: stay awake, keep signalling
+#endif
+        blinkLed(blinks, 250);
+    }
+}
+
 static void fatalHalt(const char *event, const char *detail) {
     writeStatusLog(event, detail);
     Serial.print(F("[FATAL] ")); Serial.print(event);
     if (detail && detail[0]) { Serial.print(' '); Serial.println(detail); }
     else Serial.println();
-    while (true) {
-        digitalWrite(LED_BUILTIN, HIGH); delay(250);
-        digitalWrite(LED_BUILTIN, LOW);  delay(250);
-    }
+    haltLowPower(FATAL_BLINKS_CONFIG);
 }
 
 // ---- Per-engine-start sequence ----
@@ -2770,10 +2866,13 @@ static void handleEcuFound() {
         else if (hdr == 1) { snprintf(reasonBuf, sizeof(reasonBuf),
                              "reason=ROM_ID_CHANGE new=%s", g_romId);
                              reason = reasonBuf; }
+        else if (hdr == 4) reason = "reason=BUILDER_UPDATE";   // cache from an older parser (FMT)
         else               reason = "reason=DEFS_CHANGE";
         writeStatusLog("CACHE_REGEN", reason);
         g_ecuIdNotFound = false;
-        if (!regenCache()) { fatalHalt("CACHE_WRITE_FAIL", "address_map.csv write failed"); return; }
+        // A failed build is retried, not fatal (alpha8.3): park in IDLE and try again at the
+        // next wake that finds the ECU. regenCache() already wrote CACHE_BUILD_FAIL with the cause.
+        if (!regenCache()) { g_phase = PHASE_IDLE; return; }
     } else {
         writeStatusLog("CACHE_HIT", "address_map.csv valid");
     }
@@ -2810,7 +2909,9 @@ static void handleEcuFound() {
         parseProfile(PROFILE_FILE);
     } else {
         // KNOWN ECU + logger.xml present → keep the selection parsed at boot.
-        if (g_numSel == 0) { fatalHalt("NO_PARAMS", "logger.xml has no selected parameters"); return; }
+        // (An EMPTY selection is no longer a fatal halt — it would spin awake at ~15 mA forever
+        // on an always-powered OBD port. It falls through to NO_FETCHABLE_PARAMS below, which
+        // reports it and parks in low-power IDLE.)
     }
 
     // Load the (now finalized) selection from the complete-dictionary cache. This
@@ -2819,7 +2920,7 @@ static void handleEcuFound() {
     // A false return means only a structurally bad cache → regen once and reload.
     if (!loadCacheForSelected()) {
         writeStatusLog("CACHE_REGEN", "reason=CACHE_UNREADABLE");
-        if (!regenCache()) { fatalHalt("CACHE_WRITE_FAIL", ""); return; }
+        if (!regenCache()) { g_phase = PHASE_IDLE; return; }   // retried at the next wake
         loadCacheForSelected();   // second attempt; accept whatever state we get
     }
 
@@ -2834,16 +2935,18 @@ static void handleEcuFound() {
     // with nothing to fetch can bail out without creating an empty log.
     buildFetchList();
 
-    // Nothing fetchable (every selected param NOTFOUND): the A8 request would carry zero
-    // addresses, the ECU never streams, and every engine start produced an empty log + an
-    // instant watchdog. Report once per boot and park in IDLE (re-probes every 2 min, silently)
-    // until the profile is fixed and the board power-cycled.
+    // Nothing fetchable (empty selection, or every selected param NOTFOUND): the A8 request
+    // would carry zero addresses, the ECU never streams, and every engine start produced an
+    // empty log + an instant watchdog. Report it and park in IDLE. The ROM is remembered in
+    // g_noFetchRom so later wakes that find this SAME ECU go straight back to sleep without
+    // re-running detection (alpha8.3 — in 8.2 every 2-min key-on wake re-wrote ECU_FOUND,
+    // CACHE_HIT, one NOTFOUND per param and ECU_SUPPORTED). A different ECU is still detected.
     if (g_protocol == PROTO_SSM && g_numFetch == 0) {
-        if (!g_noFetchLogged) {
-            writeStatusLog("NO_FETCHABLE_PARAMS",
-                           "no selected param is supported by this ECU — fix logger.xml; not logging");
-            g_noFetchLogged = true;
-        }
+        writeStatusLog("NO_FETCHABLE_PARAMS", g_numSelUser == 0
+            ? "profile has no selected parameters — fix logger.xml; not logging"
+            : "no selected param is supported by this ECU — fix logger.xml; not logging");
+        strncpy(g_noFetchRom, g_romId, sizeof(g_noFetchRom) - 1);
+        g_noFetchRom[sizeof(g_noFetchRom) - 1] = '\0';
         g_phase = PHASE_IDLE;
         return;
     }
@@ -3016,7 +3119,10 @@ void setup() {
         if (tud_mounted()) {
             if (enterMscMode()) {
                 Serial.println(F("[BOOT] USB host detected -> USB Mass Storage mode (SD as drive)"));
-                digitalWrite(LED_BUILTIN, HIGH);   // solid = MSC mode
+                // NOTE: no visible effect — D13 is SPI SCK and the SD card already owns it, and
+                // digitalWrite() does not take a pin back from a peripheral. Kept as a no-op
+                // marker; pinMode() here would break the drive.
+                digitalWrite(LED_BUILTIN, HIGH);
                 return;                            // skip logger init; USB thread serves the drive
             }
             // ★ FIXED alpha8.1: this used to `return` even when enterMscMode() FAILED, leaving
@@ -3030,10 +3136,9 @@ void setup() {
     // ---- SD init ----
     if (!g_sd.begin(SD_CS_PIN, SD_SCK_MHZ(25))) {
         Serial.println(F("[FATAL] SD_INIT_FAIL"));
-        while (true) {
-            digitalWrite(LED_BUILTIN, HIGH); delay(200);
-            digitalWrite(LED_BUILTIN, LOW);  delay(200);
-        }
+        // No status.log is possible, so the LED is the ONLY signal — and it used to be invisible
+        // (D13 = SPI SCK, see haltLowPower). 6-blink bursts, then low-power standby.
+        haltLowPower(FATAL_BLINKS_SD);
     }
     g_sd.mkdir("/logger");
     Serial.println(F("[BOOT] SD OK"));
@@ -3157,7 +3262,7 @@ void setup() {
         Serial.print(F("[BOOT] selftest: ")); Serial.println(st);
     }
 
-    digitalWrite(LED_BUILTIN, HIGH);   // booted and ready
+    digitalWrite(LED_BUILTIN, HIGH);   // "booted" — NO visible effect: D13 is SPI SCK (see haltLowPower)
 
     // Enter Phase 1 detection
     g_phase = PHASE_SEARCH;
@@ -3453,11 +3558,16 @@ void loop() {
         writeStatusLog("IDLE_WAKE", wd);
 
         if (protocolProbe()) {
-            // Pre-set PHASE_SEARCH before handleEcuFound(): if the file open fails
-            // and it returns early, the next loop() iteration fast-retries rather
-            // than sleeping another 2 minutes.
-            g_phase = PHASE_SEARCH;
-            handleEcuFound();
+            if (g_noFetchRom[0] && strcmp(g_romId, g_noFetchRom) == 0) {
+                // Same ECU whose selection has nothing to log (already reported once):
+                // stay parked quietly. The profile can only change via a power cycle.
+            } else {
+                // Pre-set PHASE_SEARCH before handleEcuFound(): if the file open fails
+                // and it returns early, the next loop() iteration fast-retries rather
+                // than sleeping another 2 minutes.
+                g_phase = PHASE_SEARCH;
+                handleEcuFound();
+            }
         }
     }
 
