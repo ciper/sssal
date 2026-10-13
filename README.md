@@ -127,10 +127,3 @@ in the full-speed MSC endpoint descriptor).
     sleep instead of re-running detection and re-writing its status lines every 2 minutes.
   - **Wake-timer re-arm waits for the timer to stop** before reconfiguring it, as Renesas' FSP
     driver does. It worked before only because every re-arm wrote identical values.
-
-### Pre-flight tool (`tools/SsmInitTiming.cs`)
-A PC-side J2534 validator (Tactrix OpenPort 2.0) that checks everything the firmware relies
-on **before** flashing: ROM-ID + capability decode, capability→param-name mapping, live
-param/switch/E-param (extended-address) reads, max-batch probe, single vs continuous
-(fast-poll) timing. Run `SsmInitTiming.exe`; `SsmInitTiming.exe brake` watches a switch
-toggle live. Validated on-car against an EJ ECU (ROM `2F12515506`).
